@@ -1,0 +1,23 @@
+{
+  "enabledPlugins": {
+    "static-analysis@trailofbits": false,
+    "insecure-defaults@trailofbits": false,
+    "supply-chain-risk-auditor@trailofbits": false,
+    "modern-python@trailofbits": false,
+    "differential-review@trailofbits": false
+  },
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '.claude/hooks/pre-compact.sh'",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

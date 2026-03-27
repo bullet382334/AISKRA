@@ -1,0 +1,51 @@
+# Секреты
+.env
+*.env
+secrets.txt
+
+# Локальные настройки Claude Code
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Сгенерированные файлы
+notion/.notion_state.json
+
+# Telegram сессии
+*.session
+*.session-journal
+
+# Аудио/медиа
+*.oga
+*.ogg
+*.mp3
+*.wav
+
+# Логи
+bot/bot.log
+*_debug.log
+*_tray_test.log
+*_tray_crash.log
+
+# Рантайм бота
+bot/bot.pid
+bot/buffer_*.md
+
+# Временные файлы
+*.tmp
+temp_*
+.claude/continue-prompt.md
+notion/.sync_progress.json
+notion/.sync.lock
+notion/.cover_cache.json
+
+# Отладочные файлы бота
+_group_found.txt
+bot/catchup_debug.txt
+bot/group_members.txt
+
+# Шаблон clean-architecture (не в репо)
+clean-architecture/

@@ -1,0 +1,13 @@
+# Карта проекта
+# Claude: читай этот файл для навигации. Не включает служебные (.claude/, .tasks/, transkriptsii/).
+
+состояние: _sostoyaniye.md           # где мы сейчас (≤40 строк)
+каталог: katalog.yaml                # СУЩНОСТИ: люди, места, идеи, решения → быстрый поиск «что где»
+
+karta-idej:
+  digest: karta-idej/digest.md       # навигатор (лимит строк в CLAUDE.md)
+  zhurnal: karta-idej/zhurnal.md     # хронологический лог
+  idei: {}                           # карточки появятся после обработки
+
+realizaciya:                          # ЗАЩИЩЕНО — не менять без прямого запроса
+  index: realizaciya/index.md

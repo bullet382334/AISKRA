@@ -1,0 +1,7 @@
+# Тяжёлые бинарные файлы
+project/docs/*.pdf
+project/docs/*.jpg
+docs/
+
+# Архивы
+notion/_archive/
