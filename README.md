@@ -1,25 +1,57 @@
-# AISKRA — AI-система сбора и развития идей
+# AISKRA — AI-Powered Idea Collection & Development System
 
-Готовый шаблон: Telegram-бот + Claude AI + Notion.
+Ready-to-deploy template: **Telegram bot + Claude AI + Notion**.
 
-Человек говорит голосовые → бот транскрибирует → Claude создаёт карточки, находит паттерны, генерирует вопросы → Notion-дашборд.
+A person sends voice messages → bot transcribes → Claude creates idea cards, finds patterns, generates follow-up questions → Notion dashboard with covers and galleries.
 
 ```
-Telegram-группа → Бот → Буфер → Claude → Карточки/Исследования → Notion
-       ↑                                          ↓
-  Заказчик                                 Админ (уведомления)
+Telegram group → Bot → Buffer → Claude → Cards / Research → Notion
+       ↑                                        ↓
+    Person                               Admin (notifications)
 ```
+
+## Features
+
+- **Voice transcription** via [Bukvitsa](https://bykvitsa.ru/) (or Whisper API)
+- **Automatic processing**: transcriptions → idea cards, hypotheses, decisions, risks
+- **Adaptive interviews**: AI analyzes answers and generates next questions
+- **Research**: `/research topic` → Claude does web search, creates report → Notion
+- **Notion sync**: cards with covers, galleries, task tracking
+- **Analytics**: hypothesis testing framework, prioritization criteria, checklists
+
+## Quick Start
+
+```bash
+git clone https://github.com/bullet382334/AISKRA.git
+cd AISKRA
+cp secrets.txt.example secrets.txt   # fill in tokens
+python setup.py                       # auto-configure
+cd bot && python bot.py               # run
+```
+
+Full setup guide (step-by-step, with screenshots descriptions) → [SETUP.md](SETUP.md)
+
+## Requirements
+
+- Python 3.10+
+- Node.js (for `npx claude`)
+- [Claude Code](https://claude.ai/claude-code) (Anthropic Max/Pro subscription)
+- Telegram account
+- Notion account (free tier works)
+
+## Documentation
+
+- [SETUP.md](SETUP.md) — full deployment guide (RU)
+- [ARCHITECTURE.md](ARCHITECTURE.md) — system architecture, data flows, functions (RU)
+- [CLAUDE.md](CLAUDE.md) — AI instructions (RU)
 
 ---
 
-## Что умеет
+# RU: Подробное описание
 
-- **Транскрипция** голосовых через [Буквицу](https://bykvitsa.ru/) (или Whisper API)
-- **Автоматическая обработка**: транскрипции → карточки идей, гипотез, решений, рисков
-- **Адаптивное интервью**: AI анализирует ответы и генерирует следующие вопросы
-- **Исследования**: `/research тема` → Claude делает веб-поиск, создаёт отчёт
-- **Notion-синхронизация**: карточки с обложками, галереи, задачи
-- **Аналитика**: рамка проверки гипотез, критерии приоритизации, чеклисты
+## Что это
+
+AI-система для сбора и развития идей одного человека. Заказчик говорит голосовые в Telegram-группу, бот транскрибирует, Claude обрабатывает — создаёт карточки идей, находит паттерны, генерирует вопросы, проводит исследования. Всё синхронизируется в Notion.
 
 ## Команды бота
 
@@ -30,55 +62,12 @@ Telegram-группа → Бот → Буфер → Claude → Карточки/
 | `/do задача` | Быстрая задача через Claude |
 | `/sync` | Синхронизировать карточки в Notion |
 | `/status` | Статус буфера, Claude, Notion |
+| `/buffer` | Показать содержимое буфера |
 | `/plan` | Текущий план задач |
+| `/catchup` | Проверить пропущенные сообщения |
+| `/clear` | Очистить буфер |
 
----
-
-## Быстрый старт
-
-### 1. Склонировать
-
-```bash
-git clone https://github.com/bullet382334/AISKRA.git
-cd AISKRA
-```
-
-### 2. Создать токены (руками, ~15 минут)
-
-| Что | Где |
-|-----|-----|
-| Telegram-бот | [@BotFather](https://t.me/BotFather) |
-| Telegram-группа | Telegram |
-| Telethon API | [my.telegram.org](https://my.telegram.org/) |
-| Notion интеграция | [notion.so/my-integrations](https://www.notion.so/my-integrations) |
-| Unsplash (опционально) | [unsplash.com/developers](https://unsplash.com/developers) |
-
-### 3. Заполнить secrets.txt
-
-```bash
-cp secrets.txt.example secrets.txt
-# Заполнить токенами
-```
-
-### 4. Запустить setup
-
-```bash
-python setup.py
-```
-
-Скрипт: проверит Python, установит зависимости, раскидает токены в `.env`, получит chat ID, проверит все токены.
-
-### 5. Запустить бота
-
-```bash
-cd bot && python bot.py
-```
-
-Подробнее → [SETUP.md](SETUP.md)
-
----
-
-## Структура
+## Структура проекта
 
 ```
 AISKRA/
@@ -95,28 +84,30 @@ AISKRA/
 ├── project/          ← Главный проект (заполняется по ходу)
 ├── inbox/            ← Входящие (необработанное)
 ├── transkriptsii/    ← Файлы транскрипций
-├── svodki/           ← Сводки для семьи
+├── svodki/           ← Сводки
 ├── SETUP.md          ← Пошаговая инструкция
 ├── ARCHITECTURE.md   ← Полная архитектура (305 строк)
 └── setup.py          ← Автоматизация настройки
 ```
 
----
-
-## Требования
-
-- Python 3.10+
-- Node.js (для `npx claude`)
-- [Claude Code](https://claude.ai/claude-code) (подписка Anthropic Max/Pro)
-- Telegram-аккаунт
-- Notion-аккаунт (бесплатный)
-
 ## Транскрипция
 
-По умолчанию — через [Буквицу](https://bykvitsa.ru/) ([@BukvitsaAI_bot](https://t.me/BukvitsaAI_bot), ~8 т.р./год). Альтернативы: OpenAI Whisper API, локальный Whisper. Подробности в [SETUP.md](SETUP.md).
+По умолчанию — через [Буквицу](https://bykvitsa.ru/) ([@BukvitsaAI_bot](https://t.me/BukvitsaAI_bot), ~8 т.р./год, отличное качество для русского). Альтернативы:
+- **OpenAI Whisper API** (~$0.006/мин) — заменить одну функцию в bot.py
+- **Локальный Whisper** (бесплатно, нужен GPU)
 
-## Документация
+Подробности в [SETUP.md](SETUP.md).
 
-- [SETUP.md](SETUP.md) — полная инструкция по развёртыванию
-- [ARCHITECTURE.md](ARCHITECTURE.md) — архитектура системы, потоки данных, функции
-- [CLAUDE.md](CLAUDE.md) — инструкции для AI
+## Создать токены (~15 минут)
+
+| Что | Где | Что получишь |
+|-----|-----|-------------|
+| Telegram-бот | [@BotFather](https://t.me/BotFather) | BOT_TOKEN |
+| Telegram-группа | Telegram | GROUP_CHAT_ID (setup.py получит сам) |
+| Telethon API | [my.telegram.org](https://my.telegram.org/) | API_ID, API_HASH |
+| Notion интеграция | [notion.so/my-integrations](https://www.notion.so/my-integrations) | NOTION_API_TOKEN |
+| Unsplash (опц.) | [unsplash.com/developers](https://unsplash.com/developers) | UNSPLASH_ACCESS_KEY |
+
+## Лицензия
+
+MIT
