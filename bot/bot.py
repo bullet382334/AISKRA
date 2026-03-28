@@ -1045,9 +1045,15 @@ async def cmd_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     topic = " ".join(context.args) if context.args else ""
     if not topic:
-        await message.reply_text(
-            "Что сделать?\n/do 3 — задача из плана\n/do составь письмо ..."
-        )
+        plan = parse_plan()
+        n = len(plan['do'])
+        lines = ["Что сделать?"]
+        if n == 1:
+            lines.append("/do 1 — задача из плана")
+        elif n > 1:
+            lines.append(f"/do 1–{n} — задача из плана")
+        lines.append("/do составь письмо ...")
+        await message.reply_text("\n".join(lines))
         return
     # Если цифра — взять задачу из плана (раздел do)
     from_plan = False
@@ -1161,11 +1167,15 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     topic = " ".join(context.args) if context.args else ""
     if not topic:
-        await message.reply_text(
-            "Что исследовать?\n"
-            "/research 3 — задача из плана\n"
-            "/research тема — свободная тема"
-        )
+        plan = parse_plan()
+        n = len(plan['research'])
+        lines = ["Что исследовать?"]
+        if n == 1:
+            lines.append("/research 1 — исследование из плана")
+        elif n > 1:
+            lines.append(f"/research 1–{n} — исследование из плана")
+        lines.append("/research тема — свободная тема")
+        await message.reply_text("\n".join(lines))
         return
     from_plan = False
     if topic.isdigit():
