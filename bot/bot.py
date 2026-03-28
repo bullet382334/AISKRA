@@ -75,6 +75,8 @@ pending_edit: dict | None = None  # {"type": "tasks"} or {"type": "research", "s
 _last_ask: dict | None = None     # {"question": ..., "answer": ...} — контекст последнего ask для "Уточнить"
 _last_kb_msg = None               # Message — последнее сообщение с inline-кнопками (чтобы снять при новом)
 _user_display_names: dict[int, str] = {}  # user_id → каноническое имя (заполняется в post_init)
+_autopush_scheduled = False  # защита от повторных авто-push
+_push_start_count = 0  # сколько было в буфере при старте push (для корректного отображения)
 
 
 def _resolve_name(first: str, last: str = "") -> str:
@@ -174,6 +176,23 @@ def buffer_append(sender: str, duration_str: str, text: str, message_id: int = 0
     entry = f"### {now} | {sender} ({duration_str}){msg_tag}\n{text}\n\n---\n\n"
     with open(BUFFER_FILE, "a", encoding="utf-8") as f:
         f.write(entry)
+    _maybe_schedule_autopush()
+
+
+def _maybe_schedule_autopush():
+    """Проверяет порог буфера и планирует авто-push если нужно."""
+    global _autopush_scheduled
+    if _autopush_scheduled or claude_busy:
+        return
+    count = buffer_count()
+    if count >= AUTOPUSH_THRESHOLD:
+        _autopush_scheduled = True
+        print(f"  [autopush] Буфер: {count} >= {AUTOPUSH_THRESHOLD}, планирую авто-push")
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_autopush())
+        except RuntimeError:
+            _autopush_scheduled = False
 
 
 def buffer_update(message_id: int, new_text: str) -> bool:
@@ -235,6 +254,15 @@ def buffer_clear(original_raw: str = ""):
 def buffer_count() -> int:
     content = buffer_read()
     return content.count("### ") if content else 0
+
+
+def buffer_count_display() -> str:
+    """Счётчик буфера для отображения. Во время push показывает только новые."""
+    total = buffer_count()
+    if claude_busy and _push_start_count:
+        new = total - _push_start_count
+        return f"+{new}" if new >= 0 else str(total)
+    return str(total)
 
 
 # --- Буквица (транскрипция) ---
@@ -374,6 +402,8 @@ def build_push_prompt(buffer_content: str) -> str:
         f"## Состояние проекта\n{context}\n\n"
         f"## Новые транскрипции\n{buffer_content}\n\n"
         "## Задача\n"
+        "Несколько голосовых от одного человека подряд (2-3 мин) на одну тему = переформулировка. "
+        "Используй ПОСЛЕДНЕЕ, не дублируй.\n"
         "Обработай транскрипции по workflow обработки (skill workflow-obrabotki).\n"
         "Создавай карточки в inbox/ и karta-idej/.\n"
         "НЕ ТРОГАЙ файлы в realizaciya/ — только по прямому запросу.\n"
@@ -389,12 +419,14 @@ def build_push_prompt(buffer_content: str) -> str:
         "\n"
         "## Задачи и исследования\n"
         "Если заказчик в голосовых просит что-то сделать, узнать, проверить, посчитать, "
-        "исследовать — сохрани задачи в bot/pending_tasks.txt.\n"
+        "исследовать, подсказать, найти информацию — сохрани задачи в bot/pending_tasks.txt.\n"
+        "ВАЖНО: Вопрос заказчика к AI (\"найди\", \"подскажи\", \"какие ещё\", \"что думаешь\") "
+        "= задача [research] или [do]. НЕ отвечай на вопрос в карточке — создай задачу!\n"
         "Формат: одна задача — один блок, разделитель ---\n"
         "Каждый блок: первая строка — [do] или [research] + краткое название, "
         "вторая — что конкретно нужно сделать.\n"
         "[do] = быстрое действие (позвонить, спросить, отправить, написать, оформить).\n"
-        "[research] = исследование AI (проверить, сравнить, найти, оценить, посчитать).\n"
+        "[research] = исследование AI (проверить, сравнить, найти, оценить, посчитать, подсказать).\n"
         "Пример:\n"
         "[research] Юридический анализ\n"
         "Проверить ограничения для строительства, правовой статус\n"
@@ -407,7 +439,13 @@ def build_push_prompt(buffer_content: str) -> str:
         "- Тема исследована, но заказчик просит новые данные → предложи как ОБНОВЛЕНИЕ.\n"
         "- Тема новая → предложи как новое исследование.\n"
         "Если явных запросов нет — НЕ создавай pending_tasks.txt.\n"
-        "В секции с задачами [do]/[research]: если транскрипция содержит ответ на ожидание — удали его из списка.\n"
+        "\n"
+        "## Управление списком задач в _sostoyaniye.md\n"
+        "Секция «Ждём и делаем» — АКТИВНЫЙ список. При каждом push:\n"
+        "1. ДОБАВЬ новые задачи из транскрипций (сверху списка — самые свежие)\n"
+        "2. УДАЛИ выполненные (транскрипция содержит ответ/результат)\n"
+        "3. УДАЛИ устаревшие (контекст изменился, задача потеряла смысл)\n"
+        "Не просто копируй старый список — ПЕРЕСМОТРИ каждый пункт.\n"
         "\n"
         "Действуй автономно, без вопросов."
     )
@@ -785,10 +823,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Команды бота (/slash) ---
 
-async def _push_core(reply_fn, _can_autopush=True):
-    """Ядро push-обработки. reply_fn — async callable(text, **kw) для отправки сообщений.
-    _can_autopush — разрешать ли авто-push после обработки (False для самого авто-push)."""
-    global claude_busy
+async def _push_core(reply_fn):
+    """Ядро push-обработки. reply_fn — async callable(text, **kw) для отправки сообщений."""
+    global claude_busy, _push_start_count
 
     # Очистить старые pending_tasks — новый push перезапишет если нужно
     if PENDING_TASKS.exists():
@@ -805,6 +842,7 @@ async def _push_core(reply_fn, _can_autopush=True):
 
     try:
         count = buffer_count()
+        _push_start_count = count
         # Снимок raw-содержимого ДО обработки (для сравнения после)
         raw_snapshot = BUFFER_FILE.read_text(encoding="utf-8") if BUFFER_FILE.exists() else ""
         status_msg = await reply_fn(f"Обработка {count} транскрипций...")
@@ -852,6 +890,7 @@ async def _push_core(reply_fn, _can_autopush=True):
         success, output = await loop.run_in_executor(None, run_claude, prompt, 1800)
     finally:
         claude_busy = False
+        _push_start_count = 0
         heartbeat_task.cancel()
         if ask_queue:
             asyncio.create_task(_process_ask_queue())
@@ -876,48 +915,47 @@ async def _push_core(reply_fn, _can_autopush=True):
         except (NetworkError, TimedOut):
             print("  [!] Sync-сообщение не отправлено (сеть)")
 
-        # Авто-push: планируем как отдельную задачу (не рекурсия!)
-        if _can_autopush:
-            new_count = buffer_count()
-            if new_count >= AUTOPUSH_THRESHOLD:
-                print(f"  [autopush] Буфер: {new_count} >= {AUTOPUSH_THRESHOLD}, планирую авто-push")
-                asyncio.create_task(_autopush())
+        # Перепроверить буфер: во время обработки могли накопиться новые сообщения
+        _maybe_schedule_autopush()
     else:
         summary = output[-500:] if output else "нет деталей"
         await _safe_reply(reply_fn, f"Ошибка Claude. Буфер сохранён, можно /push повторно.\n{summary}")
 
 
 async def _autopush():
-    """Авто-push: отдельная задача, свежий контекст сообщений через bot_ref.
-    Запускается максимум один раз после успешного /push.
-    Не вызывает повторный авто-push (_can_autopush=False)."""
-    if not bot_ref or not ADMIN_CHAT_ID:
-        print("  [autopush] Нет bot_ref или ADMIN_CHAT_ID, пропуск")
-        return
-
-    # Перепроверяем условия (могли измениться между планированием и запуском)
-    if claude_busy:
-        print("  [autopush] Claude занят (другая команда перехватила), пропуск")
-        return
-    count = buffer_count()
-    if count < AUTOPUSH_THRESHOLD:
-        print(f"  [autopush] Буфер: {count} < {AUTOPUSH_THRESHOLD}, пропуск")
-        return
-
-    # Свежий reply_fn через bot_ref — не зависит от старого message
-    reply_fn = lambda text, **kw: bot_ref.send_message(chat_id=ADMIN_CHAT_ID, text=text, **kw)
+    """Авто-push: срабатывает когда буфер достигает AUTOPUSH_THRESHOLD.
+    Планируется из _maybe_schedule_autopush (вызывается после buffer_append)."""
+    global _autopush_scheduled
     try:
-        await _safe_reply(reply_fn, f"Авто-push: в буфере {count} сообщений, запускаю обработку...")
-        await _push_core(reply_fn, _can_autopush=False)
-    except Exception as e:
-        print(f"  [autopush] Ошибка: {e}")
+        if not bot_ref or not ADMIN_CHAT_ID:
+            print("  [autopush] Нет bot_ref или ADMIN_CHAT_ID, пропуск")
+            return
+
+        # Перепроверяем условия (могли измениться между планированием и запуском)
+        if claude_busy:
+            print("  [autopush] Claude занят, пропуск")
+            return
+        count = buffer_count()
+        if count < AUTOPUSH_THRESHOLD:
+            print(f"  [autopush] Буфер: {count} < {AUTOPUSH_THRESHOLD}, пропуск")
+            return
+
+        # Свежий reply_fn через bot_ref — не зависит от старого message
+        reply_fn = lambda text, **kw: bot_ref.send_message(chat_id=ADMIN_CHAT_ID, text=text, **kw)
         try:
-            await bot_ref.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=f"Авто-push не удался: {e}\nБуфер сохранён, можно /push вручную.",
-            )
-        except Exception:
-            pass  # Совсем нет связи — молча логируем
+            await _safe_reply(reply_fn, f"Авто-push: в буфере {count} сообщений, запускаю обработку...")
+            await _push_core(reply_fn)
+        except Exception as e:
+            print(f"  [autopush] Ошибка: {e}")
+            try:
+                await bot_ref.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=f"Авто-push не удался: {e}\nБуфер сохранён, можно /push вручную.",
+                )
+            except Exception:
+                pass
+    finally:
+        _autopush_scheduled = False
 
 
 async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -931,7 +969,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/status — показать состояние."""
     if not is_admin(update):
         return
-    count = buffer_count()
+    count = buffer_count_display()
     busy = "обрабатывает" if claude_busy else "свободен"
     plan = parse_plan()
     plan_tasks = len(plan['do']) + len(plan['research'])
@@ -1106,6 +1144,7 @@ async def cmd_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
         claude_busy = False
         if ask_queue:
             asyncio.create_task(_process_ask_queue())
+        _maybe_schedule_autopush()
 
     if success:
         if from_plan:
@@ -1233,6 +1272,7 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
         claude_busy = False
         if ask_queue:
             asyncio.create_task(_process_ask_queue())
+        _maybe_schedule_autopush()
     if success:
         if from_plan:
             remove_from_plan(topic)
@@ -1344,16 +1384,16 @@ async def _process_voice(bot: Bot, file_id: str, sender: str, duration: int, ts:
     _remove_pending_voice(file_id)
 
     buffer_append(sender, dur_str, text)
-    count = buffer_count()
+    cnt = buffer_count_display()
     preview = text[:100] + ("..." if len(text) > 100 else "")
     tag_str = f" {tag}" if tag else ""
 
     if ADMIN_CHAT_ID and bot_ref:
         await bot_ref.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=f"\U0001f399 {sender} ({dur_str}): {preview} | Буфер: {count}{tag_str}",
+            text=f"\U0001f399 {sender} ({dur_str}): {preview} | Буфер: {cnt}{tag_str}",
         )
-    print(f"  {md_name} | Буфер: {count}{tag_str}")
+    print(f"  {md_name} | Буфер: {cnt}{tag_str}")
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1416,6 +1456,7 @@ async def _handle_edit_comment(message, comment: str):
             claude_busy = False
             if ask_queue:
                 asyncio.create_task(_process_ask_queue())
+            _maybe_schedule_autopush()
         if success and PENDING_TASKS.exists():
             pending = read_pending_tasks()
             task_lines = "\n".join(f"  {i+1}. {t.splitlines()[0]}" for i, t in enumerate(pending))
@@ -1458,6 +1499,7 @@ async def _handle_edit_comment(message, comment: str):
             claude_busy = False
             if ask_queue:
                 asyncio.create_task(_process_ask_queue())
+            _maybe_schedule_autopush()
         if success:
             await message.reply_text("Доработано.")
             await _do_sync(message.reply_text)
@@ -1518,6 +1560,7 @@ async def _handle_edit_comment(message, comment: str):
             claude_busy = False
             if ask_queue:
                 asyncio.create_task(_process_ask_queue())
+            _maybe_schedule_autopush()
 
         if success:
             answer = output.strip() if output else "(нет ответа)"
@@ -1576,14 +1619,14 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"  [группа-вход] ПРОПУСК: msg:{message.message_id} уже в буфере (catchup)")
         return
     buffer_append(sender, "текст", text, message_id=message.message_id)
-    count = buffer_count()
+    cnt = buffer_count_display()
     preview = text[:100] + ("..." if len(text) > 100 else "")
     if ADMIN_CHAT_ID and bot_ref:
         await bot_ref.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=f"\U0001f4dd {sender} ({len(text)} симв): {preview} | Буфер: {count}",
+            text=f"\U0001f4dd {sender} ({len(text)} симв): {preview} | Буфер: {cnt}",
         )
-    print(f"  [группа] {sender} ({len(text)} симв) | Буфер: {count}")
+    print(f"  [группа] {sender} ({len(text)} симв) | Буфер: {cnt}")
 
 
 async def handle_edited_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1617,13 +1660,13 @@ async def handle_edited_group_text(update: Update, context: ContextTypes.DEFAULT
     else:
         # Записи нет (уже обработана или не попадала) — добавить как новую
         buffer_append(sender, "текст", text, message_id=msg_id)
-        count = buffer_count()
-        print(f"  [группа-edit] {sender} msg:{msg_id} добавлено (не было в буфере) | Буфер: {count}")
+        cnt = buffer_count_display()
+        print(f"  [группа-edit] {sender} msg:{msg_id} добавлено (не было в буфере) | Буфер: {cnt}")
         if ADMIN_CHAT_ID and bot_ref:
             preview = text[:80] + ("..." if len(text) > 80 else "")
             await bot_ref.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text=f"\u270f {sender} (изм.): {preview} | Буфер: {count}",
+                text=f"\u270f {sender} (изм.): {preview} | Буфер: {cnt}",
             )
 
 
@@ -1681,6 +1724,7 @@ async def _handle_ask(message, question: str):
         claude_busy = False
         if ask_queue:
             asyncio.create_task(_process_ask_queue())
+        _maybe_schedule_autopush()
 
     if success:
         answer = output.strip() if output else "(нет ответа)"
@@ -1917,13 +1961,13 @@ async def _catchup_group_history(bot: Bot, force: bool = False):
                 continue
             buffer_append(sender_name, "текст", text, message_id=msg.id)
             catchup_known_ids.add(msg.id)
-            count = buffer_count()
+            cnt = buffer_count_display()
             preview = text[:80] + ("..." if len(text) > 80 else "")
             print(f"  Catchup group: текст {sender_name} ({ts}): {preview[:40]}")
             if ADMIN_CHAT_ID:
                 await bot.send_message(
                     chat_id=ADMIN_CHAT_ID,
-                    text=f"\U0001f4dd {sender_name}: {preview} | Буфер: {count} [подхвачено]",
+                    text=f"\U0001f4dd {sender_name}: {preview} | Буфер: {cnt} [подхвачено]",
                 )
     except Exception as e:
         print(f"  Catchup group ошибка: {e}")
@@ -2007,6 +2051,9 @@ async def post_init(app):
 
     asyncio.create_task(_periodic_catchup())
     print(f"  Catchup-таймер: каждые {CATCHUP_INTERVAL // 60} мин")
+
+    # Проверить буфер при старте — мог накопиться до перезапуска
+    _maybe_schedule_autopush()
 
 
 async def post_shutdown(app):
