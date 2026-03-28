@@ -33,6 +33,7 @@ bot/bot.log
 # Рантайм бота
 bot/bot.pid
 bot/buffer_*.md
+bot/_running_task.json
 
 # Временные файлы
 *.tmp

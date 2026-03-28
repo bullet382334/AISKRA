@@ -1905,8 +1905,13 @@ def sync_realizaciya_gallery(state, old_hashes, new_hashes):
             safe_print(f"  [ok] Обновлено содержимое: {card_config['title']}")
 
             updated += 1
-            is_new_card = f"card_{key}" not in state.get("notified_cards", [])
+            notify_key = f"card_{key}"
+            notified = state.get("notified_cards", [])
+            is_new_card = notify_key not in notified
             track_synced_card(card_config["title"], is_new=is_new_card, source_file=source)
+            if is_new_card:
+                notified.append(notify_key)
+                state["notified_cards"] = notified
 
         # Сохраняем хеши и state после каждой карточки (защита от таймаута)
         state["realizaciya_cards"] = cards_state

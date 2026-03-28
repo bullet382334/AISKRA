@@ -17,6 +17,7 @@ except Exception:
     pass
 
 import asyncio
+import hashlib
 import json
 import re
 import shutil
@@ -51,7 +52,7 @@ NPX = shutil.which("npx.cmd") or shutil.which("npx") or r"C:\Program Files\nodej
 RESEARCH_TIMEOUT = 1800  # 30 минут на исследование
 SYNC_TIMEOUT = 900       # 15 минут на Notion sync
 ASK_TIMEOUT = 120        # 2 минуты на вопрос
-AUTOPUSH_THRESHOLD = 15          # авто-push если после обработки в буфере >= N сообщений
+AUTOPUSH_THRESHOLD = 5           # авто-push если после обработки в буфере >= N сообщений
 # Фильтр участников группы: ID (надёжно) → username → first_name (ненадёжно)
 # GROUP_ALLOWED_IDS из .env — через запятую, например: 123456,789012
 _raw_ids = os.environ.get("GROUP_ALLOWED_IDS", "")
@@ -60,6 +61,7 @@ GROUP_ALLOWED_USERNAMES: set[str] = set()  # заполняется автома
 GROUP_ALLOWED_NAMES: set[str] = set()  # fallback — заполняется из участников группы
 GROUP_MEMBERS_FILE = Path(__file__).parent / "group_members.txt"
 PENDING_VOICES = Path(__file__).parent / "pending_voices.json"
+RUNNING_TASK_FILE = Path(__file__).parent / "_running_task.json"
 
 telethon_client = TelegramClient(
     str(Path(__file__).parent / "bukvitsa_session"), API_ID, API_HASH,
@@ -68,15 +70,17 @@ bukvitsa_lock = asyncio.Lock()
 sync_lock = asyncio.Lock()
 sync_proc: subprocess.Popen | None = None  # ссылка на процесс sync для возможности остановки
 claude_busy = False
+_autopush_scheduled = False  # защита от повторных авто-push
+_push_start_count = 0  # сколько было в буфере при старте push (для корректного отображения)
 ask_queue: list = []  # [(message, question), ...] — очередь вопросов пока Claude занят
+command_queue: list = []  # [("research", topic, reply_fn, from_plan), ...] — очередь research/do
 bot_ref: Bot | None = None
 BOT_USER_ID: int = 0  # заполняется в post_init — для фильтрации своих сообщений в catchup
-pending_edit: dict | None = None  # {"type": "tasks"} or {"type": "research", "slug": "..."} or {"type": "ask", ...}
+pending_edit: dict | None = None  # {"type": "research", "slug": "..."} or {"type": "ask", ...}
+pending_command: str | None = None  # "research" или "do" — бот ждёт аргумент после показа меню
 _last_ask: dict | None = None     # {"question": ..., "answer": ...} — контекст последнего ask для "Уточнить"
 _last_kb_msg = None               # Message — последнее сообщение с inline-кнопками (чтобы снять при новом)
 _user_display_names: dict[int, str] = {}  # user_id → каноническое имя (заполняется в post_init)
-_autopush_scheduled = False  # защита от повторных авто-push
-_push_start_count = 0  # сколько было в буфере при старте push (для корректного отображения)
 
 
 def _resolve_name(first: str, last: str = "") -> str:
@@ -348,10 +352,36 @@ async def transcribe_via_bukvitsa(audio_path: str) -> str:
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 
+_pre_claude_dirty: dict[str, str | None] = {}  # {fname: md5} — снимок до Claude
+
+
+def _snapshot_dirty_files() -> dict[str, str | None]:
+    """Снимок грязных файлов: {fname: content_md5}. Для фильтрации autocommit."""
+    try:
+        r = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=str(PROJECT_DIR),
+            capture_output=True, text=True, timeout=10,
+        )
+        snap = {}
+        for line in r.stdout.strip().splitlines():
+            if not line.strip():
+                continue
+            fname = line[3:].strip().strip('"').split(" -> ")[-1]
+            p = PROJECT_DIR / fname
+            try:
+                snap[fname] = hashlib.md5(p.read_bytes()).hexdigest() if p.is_file() else None
+            except Exception:
+                snap[fname] = None
+        return snap
+    except Exception:
+        return {}
+
 
 def run_claude(prompt: str, timeout: int = 600, model: str = "sonnet",
                max_thinking: int | None = None) -> tuple[bool, str]:
     """Запускает Claude CLI. Возвращает (success, output)."""
+    global _pre_claude_dirty
+    _pre_claude_dirty = _snapshot_dirty_files()
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     if max_thinking is not None:
@@ -384,8 +414,25 @@ def run_claude(prompt: str, timeout: int = 600, model: str = "sonnet",
         return False, str(e)
 
 
+def _save_running_task(task_type: str, topic: str, from_plan: bool):
+    """Сохраняет текущую задачу в файл для recovery после рестарта."""
+    RUNNING_TASK_FILE.write_text(json.dumps({
+        "type": task_type, "topic": topic, "from_plan": from_plan,
+        "pid": os.getpid(),
+    }, ensure_ascii=False), encoding="utf-8")
+
+
+def _clear_running_task():
+    """Удаляет файл текущей задачи после завершения."""
+    try:
+        RUNNING_TASK_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def build_push_prompt(buffer_content: str) -> str:
-    """Контекст проекта + буфер → промпт для Claude."""
+    """Контекст проекта + буфер → промпт для Claude.
+    По workflow kontekst-loading.md (вход: push): state, digest, katalog, index."""
     parts = []
     for name, path in [
         ("_sostoyaniye.md", PROJECT_DIR / "_sostoyaniye.md"),
@@ -410,56 +457,33 @@ def build_push_prompt(buffer_content: str) -> str:
         "НЕ запускай web search без прямого указания.\n"
         "Обнови digest.md и _sostoyaniye.md. Лимиты строк — из CLAUDE.md.\n"
         "\n"
-        "## Размещение новой информации (ОБЯЗАТЕЛЬНО)\n"
-        "Используй katalog.yaml для навигации:\n"
-        "- Упоминается сущность из каталога → ДОПОЛНИ существующий файл\n"
-        "- Новая сущность (человек, место, идея, решение) → СОЗДАЙ файл + ДОБАВЬ в katalog.yaml\n"
-        "- Противоречит существующему факту → НЕ ЗАТИРАЙ, сохрани оба варианта\n"
-        "- Непонятно куда → inbox/\n"
+        "## Размещение новой информации\n"
+        "Применяй gating rules из .claude/workflows/gating-rules.md.\n"
         "\n"
-        "## Задачи и исследования\n"
-        "Если заказчик в голосовых просит что-то сделать, узнать, проверить, посчитать, "
-        "исследовать, подсказать, найти информацию — сохрани задачи в bot/pending_tasks.txt.\n"
-        "ВАЖНО: Вопрос заказчика к AI (\"найди\", \"подскажи\", \"какие ещё\", \"что думаешь\") "
-        "= задача [research] или [do]. НЕ отвечай на вопрос в карточке — создай задачу!\n"
-        "Формат: одна задача — один блок, разделитель ---\n"
-        "Каждый блок: первая строка — [do] или [research] + краткое название, "
-        "вторая — что конкретно нужно сделать.\n"
-        "[do] = быстрое действие (позвонить, спросить, отправить, написать, оформить).\n"
-        "[research] = исследование AI (проверить, сравнить, найти, оценить, посчитать, подсказать).\n"
-        "Пример:\n"
-        "[research] Юридический анализ\n"
-        "Проверить ограничения для строительства, правовой статус\n"
-        "---\n"
-        "[do] Уточнить условия\n"
-        "Связаться с контактом, запросить недостающую информацию\n"
-        "---\n"
-        "ВАЖНО: Сверься с realizaciya/index.md — там список ГОТОВЫХ исследований.\n"
-        "- Тема уже исследована и заказчик НЕ просит обновить → НЕ предлагай.\n"
-        "- Тема исследована, но заказчик просит новые данные → предложи как ОБНОВЛЕНИЕ.\n"
-        "- Тема новая → предложи как новое исследование.\n"
-        "Если явных запросов нет — НЕ создавай pending_tasks.txt.\n"
-        "\n"
-        "## Управление списком задач в _sostoyaniye.md\n"
+        "## Задачи — управляй ТОЛЬКО через _sostoyaniye.md\n"
+        "НЕ создавай bot/pending_tasks.txt. Все задачи — напрямую в _sostoyaniye.md.\n"
         "Секция «Ждём и делаем» — АКТИВНЫЙ список. При каждом push:\n"
-        "1. ДОБАВЬ новые задачи из транскрипций (сверху списка — самые свежие)\n"
-        "2. УДАЛИ выполненные (транскрипция содержит ответ/результат)\n"
-        "3. УДАЛИ устаревшие (контекст изменился, задача потеряла смысл)\n"
-        "Не просто копируй старый список — ПЕРЕСМОТРИ каждый пункт.\n"
+        "1. ДОБАВЬ новые из транскрипций (свежие сверху, формат: '- [do] ...' или '- [research] ...')\n"
+        "2. УДАЛИ выполненные [do] (транскрипция содержит ответ/результат)\n"
+        "3. УДАЛИ устаревшие [do] (контекст изменился)\n"
+        "ВАЖНО: [research] задачи НИКОГДА не удаляй — они закрываются ТОЛЬКО ботом после выполнения.\n"
+        "4. НЕ дублируй — пересмотри каждый пункт\n"
+        "5. Формат строки: КОРОТКО, БЕЗ ссылок на файлы, БЕЗ URL, БЕЗ → realizaciya/...\n"
+        "[do] = действие человека. [research] = исследование AI.\n"
+        "Вопрос заказчика к AI (\"найди\", \"подскажи\", \"какие ещё\") = [research].\n"
+        "Сверься с realizaciya/index.md — если тема уже исследована, НЕ предлагай.\n"
         "\n"
         "Действуй автономно, без вопросов."
     )
 
 
 def build_research_prompt(task: str) -> str:
-    """Контекст проекта + задача → промпт для исследования."""
+    """Задача + контекст по workflow kontekst-loading.md (вход: конкретная задача).
+    Только realizaciya/index.md + digest-proekty.md. Остальное Claude прочитает сам."""
     parts = []
     for name, path in [
-        ("_sostoyaniye.md", PROJECT_DIR / "_sostoyaniye.md"),
-        ("digest.md", PROJECT_DIR / "karta-idej" / "digest.md"),
-        ("katalog.yaml", PROJECT_DIR / "katalog.yaml"),
-        ("index.yaml", PROJECT_DIR / "index.yaml"),
         ("realizaciya/index.md", PROJECT_DIR / "realizaciya" / "index.md"),
+        ("digest-proekty.md", PROJECT_DIR / "karta-idej" / "digest-proekty.md"),
     ]:
         if path.exists():
             parts.append(f"--- {name} ---\n{path.read_text(encoding='utf-8')}")
@@ -469,23 +493,15 @@ def build_research_prompt(task: str) -> str:
         f"## Контекст проекта\n{context}\n\n"
         f"## Задача на исследование\n{task}\n\n"
         "## Инструкции\n"
-        "Проведи исследование по задаче выше.\n"
-        "Следуй workflow реализации (skill workflow-realizaciya).\n"
+        "Проведи исследование СТРОГО по задаче выше. НЕ подменяй тему, не расширяй scope.\n"
+        "Создавай НОВЫЙ файл в realizaciya/ — не обновляй существующие файлы других исследований.\n"
         "ОБЯЗАТЕЛЬНО используй web search для актуальных данных.\n"
-        "Создай файл в realizaciya/ по шаблону из workflow.\n"
+        "Следуй skill workflow-realizaciya (шаблон файла, структура).\n"
         "Обнови realizaciya/index.md, index.yaml, katalog.yaml и _sostoyaniye.md.\n"
-        "В _sostoyaniye.md: УДАЛИ задачи [do]/[research], которые исследование закрыло. "
-        "Новые задачи добавляй с тегом [do] или [research]: '- [do] Спросить...' или '- [research] Проверить...'. "
-        "Без тега = ожидание от других людей. Каждая строка — одно действие, коротко. БЕЗ ссылок, телефонов, подробностей.\n"
-        "Добавь новое исследование в katalog.yaml (тип: исследование, связи, файлы).\n"
-        "ОБЯЗАТЕЛЬНО создай файл bot/msg-{slug}.txt где {slug} — ТОЧНО совпадает с именем файла в realizaciya/{slug}.md.\n"
-        "Пример: если файл realizaciya/kredit-analiz.md → msg-файл bot/msg-kredit-analiz.txt. Slug ОБЯЗАН совпадать!\n"
-        "Формат msg-файла — по правилам из skill format-research-tg:\n"
-        "  - Блоки разделены ---\n"
-        "  - HTML parse_mode: <b>жирный</b> (НЕ Markdown **)\n"
-        "  - Блок 1: эмодзи + <b>заголовок</b> + суть (1-2 строки)\n"
-        "  - Блоки 2-N: чеклист из 'Что делать', сгруппированный по темам с эмодзи\n"
-        "  - Последний блок: 🔑 <b>Самое срочное:</b> что делать прямо сейчас\n"
+        "В _sostoyaniye.md: [research] задачи НЕ трогай (бот удалит сам после завершения). "
+        "УДАЛИ [do] которые исследование сделало неактуальными. "
+        "Новые задачи — с тегом: '- [do] ...' или '- [research] ...'. Свежие сверху.\n"
+        "Создай bot/msg-{slug}.txt по skill format-research-tg (slug = имя файла без .md).\n"
         "Действуй автономно, без вопросов."
     )
 
@@ -518,20 +534,8 @@ def remove_from_plan(task_text: str):
         path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
 
-def add_tasks_to_sostoyaniye(new_tasks: list[str]):
-    """Добавляет задачи в _sostoyaniye.md (перед '## Следующий шаг AI')."""
-    path = PROJECT_DIR / "_sostoyaniye.md"
-    if not path.exists():
-        return
-    content = path.read_text(encoding="utf-8")
-    marker = "## Следующий шаг AI"
-    if marker in content:
-        insert_lines = "\n".join(f"- **{t.splitlines()[0]}**" for t in new_tasks)
-        content = content.replace(marker, f"{insert_lines}\n\n{marker}")
-    else:
-        insert_lines = "\n".join(f"- **{t.splitlines()[0]}**" for t in new_tasks)
-        content = content.rstrip() + "\n" + insert_lines + "\n"
-    path.write_text(content, encoding="utf-8")
+
+# add_tasks_to_sostoyaniye — удалена: задачи управляются Claude напрямую в _sostoyaniye.md
 
 
 def read_pending_tasks() -> list[str]:
@@ -550,6 +554,84 @@ def get_git_diff_stat() -> str:
         return r.stdout.strip() or "(нет незакоммиченных изменений)"
     except Exception:
         return "(не удалось прочитать git)"
+
+
+_GIT_SKIP = {".env", "bot/buffer.md", "bot/pending_voices.json",
+             "bot/pending_tasks.txt", "bot.pid", "bot/_running_task.json"}
+_GIT_SKIP_PATTERNS = ("buffer_", ".session", ".pid", ".key", ".pem")
+
+
+def _compute_changed_files() -> list[str]:
+    """Файлы, изменённые Claude (сравнивает с snapshot до запуска). Без секретов/буферов."""
+    global _pre_claude_dirty
+    pre = _pre_claude_dirty
+    _pre_claude_dirty = {}
+    try:
+        r = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=str(PROJECT_DIR),
+            capture_output=True, text=True, timeout=10,
+        )
+        files = []
+        for line in r.stdout.strip().splitlines():
+            if not line.strip():
+                continue
+            fname = line[3:].strip().strip('"').split(" -> ")[-1]
+            if fname in _GIT_SKIP:
+                continue
+            if any(p in fname for p in _GIT_SKIP_PATTERNS):
+                continue
+            if fname in pre:
+                p = PROJECT_DIR / fname
+                try:
+                    cur = hashlib.md5(p.read_bytes()).hexdigest() if p.is_file() else None
+                except Exception:
+                    cur = None
+                if cur == pre[fname]:
+                    continue
+            files.append(fname)
+        return files
+    except Exception:
+        return []
+
+
+def _git_commit_and_push(commit_type: str, files: list[str]) -> bool:
+    """Коммитит указанные файлы и пушит."""
+    try:
+        cwd = str(PROJECT_DIR)
+        for f in files:
+            subprocess.run(["git", "add", "--", f], cwd=cwd, capture_output=True, timeout=10)
+        short_files = ", ".join(Path(f).name for f in files[:5])
+        if len(files) > 5:
+            short_files += f" (+{len(files) - 5})"
+        subprocess.run(
+            ["git", "commit", "-m", f"{commit_type}\n\n{short_files}"],
+            cwd=cwd, capture_output=True, timeout=10,
+        )
+        subprocess.run(["git", "push"], cwd=cwd, capture_output=True, timeout=30)
+        print(f"  [git] {commit_type} ({len(files)} файлов)")
+        return True
+    except Exception as e:
+        print(f"  [git] Ошибка коммита: {e}")
+        return False
+
+
+_pending_git_commit: tuple | None = None  # (commit_type, [files])
+
+
+async def _offer_commit(reply_fn, commit_type: str):
+    """Полуавто-коммит: предлагает кнопку, коммитит только файлы Claude."""
+    global _pending_git_commit
+    files = await asyncio.get_event_loop().run_in_executor(None, _compute_changed_files)
+    if not files:
+        return
+    _pending_git_commit = (commit_type, files)
+    fnames = ", ".join(Path(f).name for f in files[:4])
+    if len(files) > 4:
+        fnames += f" (+{len(files) - 4})"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"Коммит + push ({len(files)})", callback_data="do_commit")
+    ]])
+    await _safe_reply(reply_fn, fnames, reply_markup=kb)
 
 
 
@@ -766,7 +848,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    if data == "stop_sync":
+    if data == "do_commit":
+        if _pending_git_commit:
+            commit_type, files = _pending_git_commit
+            loop = asyncio.get_event_loop()
+            ok = await loop.run_in_executor(None, _git_commit_and_push, commit_type, files)
+            if ok:
+                await query.message.reply_text(f"Коммит + push OK ({len(files)} файлов)")
+            else:
+                await query.message.reply_text("Ошибка коммита")
+        else:
+            await query.message.reply_text("Нечего коммитить")
+        return
+    elif data == "stop_sync":
         if sync_proc and sync_proc.poll() is None:
             sync_proc.kill()
             await query.message.reply_text("Sync остановлен.")
@@ -780,22 +874,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"(предыдущая правка '{old}' отменена)")
         pending_edit = {"type": "research", "slug": slug}
         await query.message.reply_text("Напиши, что доработать в исследовании (это займёт до 30 мин):")
-    elif data == "edit_tasks":
-        pending_edit = {"type": "tasks"}
-        await query.message.reply_text("Напиши, что изменить в задачах:")
-    elif data == "approve_tasks":
-        pending = read_pending_tasks()
-        if not pending:
-            await query.message.reply_text("Задачи уже обработаны.")
-            return
-        add_tasks_to_sostoyaniye(pending)
-        PENDING_TASKS.unlink()
-        names = "\n".join(f"  {i+1}. {t.splitlines()[0]}" for i, t in enumerate(pending))
-        await query.message.reply_text(f"Добавлено в план ({len(pending)}):\n{names}")
-    elif data == "skip_tasks":
-        if PENDING_TASKS.exists():
-            PENDING_TASKS.unlink()
-        await query.message.reply_text("Задачи пропущены.")
+    # approve_tasks / skip_tasks / edit_tasks — убраны: задачи управляются Claude напрямую в _sostoyaniye.md
     elif data == "ask_send":
         # Отправить ответ Claude в группу
         answer_text = query.message.text_html or query.message.text or ""
@@ -899,21 +978,22 @@ async def _push_core(reply_fn):
         buffer_clear(raw_snapshot)
         diff = await asyncio.get_event_loop().run_in_executor(None, get_git_diff_stat)
 
+        # pending_tasks.txt больше не используется для push:
+        # Claude сам редактирует _sostoyaniye.md → нет двойного добавления
+        PENDING_TASKS.unlink(missing_ok=True)
+
         # Отправка результатов с retry (сеть может быть нестабильной)
         try:
             await _safe_reply(reply_fn, f"Обработано.\n\n{diff}")
         except (NetworkError, TimedOut):
-            pass  # Логируется внутри _safe_reply, продолжаем
-
-        pending = read_pending_tasks()
-        if pending:
-            add_tasks_to_sostoyaniye(pending)
-            PENDING_TASKS.unlink(missing_ok=True)
+            pass
 
         try:
             await _do_sync(reply_fn)
         except (NetworkError, TimedOut):
             print("  [!] Sync-сообщение не отправлено (сеть)")
+
+        await _offer_commit(reply_fn, "content: обработка буфера")
 
         # Перепроверить буфер: во время обработки могли накопиться новые сообщения
         _maybe_schedule_autopush()
@@ -1077,7 +1157,7 @@ DO_TIMEOUT = 300  # 5 минут на быструю задачу
 
 async def cmd_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/do тема — быстрая задача (письмо, текст, расчёт) без полного исследования."""
-    global claude_busy
+    global claude_busy, pending_command
     if not is_admin(update):
         return
     message = update.message
@@ -1087,11 +1167,12 @@ async def cmd_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
         n = len(plan['do'])
         lines = ["Что сделать?"]
         if n == 1:
-            lines.append("/do 1 — задача из плана")
+            lines.append("1 — задача из плана")
         elif n > 1:
-            lines.append(f"/do 1–{n} — задача из плана")
-        lines.append("/do составь письмо ...")
+            lines.append(f"1–{n} — задача из плана")
+        lines.append("или напиши задачу свободно")
         await message.reply_text("\n".join(lines))
+        pending_command = "do"
         return
     # Если цифра — взять задачу из плана (раздел do)
     from_plan = False
@@ -1104,7 +1185,8 @@ async def cmd_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic = plan['do'][idx]
         from_plan = True
     if claude_busy:
-        await message.reply_text("Claude занят, подожди.")
+        command_queue.append(("do", topic, message, from_plan))
+        await message.reply_text(f"Claude занят. Задача «{topic[:60]}» в очереди, запустится автоматически.")
         return
     claude_busy = True
 
@@ -1149,6 +1231,8 @@ async def cmd_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         if from_plan:
             remove_from_plan(topic)
+        short_topic = topic[:50]
+        await _offer_commit(message.reply_text, f"do: {short_topic}")
         # Показать результат Claude
         summary = output.strip() if output else "(нет вывода)"
         text = f"Готово.\n\n{summary}"
@@ -1200,7 +1284,7 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/research N или /research тема — запустить исследование."""
-    global claude_busy
+    global claude_busy, pending_command
     if not is_admin(update):
         return
     message = update.message
@@ -1210,11 +1294,12 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
         n = len(plan['research'])
         lines = ["Что исследовать?"]
         if n == 1:
-            lines.append("/research 1 — исследование из плана")
+            lines.append("1 — исследование из плана")
         elif n > 1:
-            lines.append(f"/research 1–{n} — исследование из плана")
-        lines.append("/research тема — свободная тема")
+            lines.append(f"1–{n} — исследование из плана")
+        lines.append("или напиши тему свободно")
         await message.reply_text("\n".join(lines))
+        pending_command = "research"
         return
     from_plan = False
     if topic.isdigit():
@@ -1226,7 +1311,8 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic = plan['research'][idx]
         from_plan = True
     if claude_busy:
-        await message.reply_text("Claude занят, подожди.")
+        command_queue.append(("research", topic, message, from_plan))
+        await message.reply_text(f"Claude занят. Исследование «{topic[:60]}» в очереди, запустится автоматически.")
         return
     claude_busy = True
 
@@ -1261,12 +1347,14 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
         heartbeat_task = asyncio.create_task(_research_heartbeat()) if status_msg else None
+        _save_running_task("research", topic, from_plan)
         prompt = build_research_prompt(topic)
         loop = asyncio.get_event_loop()
         success, output = await loop.run_in_executor(
             None, run_claude, prompt, RESEARCH_TIMEOUT,
         )
     finally:
+        _clear_running_task()
         if heartbeat_task:
             heartbeat_task.cancel()
         claude_busy = False
@@ -1308,6 +1396,8 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             except Exception as e:
                 await message.reply_text(f"Ошибка отправки в группу: {e}")
+        short_topic = topic[:50]
+        await _offer_commit(message.reply_text, f"research: {short_topic}")
     else:
         summary = output[-500:] if output else "нет деталей"
         await message.reply_text(f"Ошибка исследования.\n{summary}")
@@ -1423,7 +1513,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _handle_edit_comment(message, comment: str):
-    """Обработка комментария к вопросам / задачам / исследованию / уточнению ask."""
+    """Обработка комментария к исследованию / уточнению ask."""
     global claude_busy, pending_edit, _last_ask, _last_kb_msg
     edit_ctx = pending_edit
     pending_edit = None
@@ -1438,38 +1528,7 @@ async def _handle_edit_comment(message, comment: str):
         await message.reply_text("Claude занят, подожди. Повтори комментарий позже.")
         return
 
-    if edit_type == "tasks":
-        claude_busy = True
-        try:
-            await message.reply_text("Передаю Claude...")
-            prompt = (
-                "В файле bot/pending_tasks.txt лежат задачи.\n"
-                f"Комментарий: {comment}\n"
-                "Исправь задачи по комментарию. "
-                "Сохрани формат: одна задача — один блок, разделитель ---. "
-                "Первая строка блока — [do] или [research] + краткое название, вторая — что сделать."
-            )
-            loop = asyncio.get_event_loop()
-            success, _ = await loop.run_in_executor(
-                None, lambda: run_claude(prompt, 180, model="haiku"))
-        finally:
-            claude_busy = False
-            if ask_queue:
-                asyncio.create_task(_process_ask_queue())
-            _maybe_schedule_autopush()
-        if success and PENDING_TASKS.exists():
-            pending = read_pending_tasks()
-            task_lines = "\n".join(f"  {i+1}. {t.splitlines()[0]}" for i, t in enumerate(pending))
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("В план", callback_data="approve_tasks"),
-                 InlineKeyboardButton("Пропустить", callback_data="skip_tasks"),
-                 InlineKeyboardButton("Исправить", callback_data="edit_tasks")],
-            ])
-            await message.reply_text(f"Обновлены ({len(pending)}):\n{task_lines}", reply_markup=kb)
-        else:
-            await message.reply_text("Не удалось переделать.")
-
-    elif edit_type == "research":
+    if edit_type == "research":
         slug = edit_ctx.get("slug", "")
         filepath = f"realizaciya/{slug}.md"
         full_path = PROJECT_DIR / filepath
@@ -1502,6 +1561,7 @@ async def _handle_edit_comment(message, comment: str):
             _maybe_schedule_autopush()
         if success:
             await message.reply_text("Доработано.")
+            await _offer_commit(message.reply_text, f"refine: {slug}")
             await _do_sync(message.reply_text)
             # Отправить обновлённое исследование в группу заказчика
             if bot_ref:
@@ -1563,6 +1623,7 @@ async def _handle_edit_comment(message, comment: str):
             _maybe_schedule_autopush()
 
         if success:
+            await _offer_commit(message.reply_text, f"ask-refine: {comment[:50]}")
             answer = output.strip() if output else "(нет ответа)"
             if len(answer) > 3800:
                 answer = answer[:3800] + "\n...(обрезано)"
@@ -1671,11 +1732,134 @@ async def handle_edited_group_text(update: Update, context: ContextTypes.DEFAULT
 
 
 async def _process_ask_queue():
-    """Обработать следующий вопрос из очереди если Claude свободен."""
-    if not ask_queue or claude_busy:
+    """Обработать следующий вопрос/команду из очереди если Claude свободен."""
+    if claude_busy:
         return
-    message, question = ask_queue.pop(0)
-    await _handle_ask(message, question)
+    if ask_queue:
+        message, question = ask_queue.pop(0)
+        await _handle_ask(message, question)
+    elif command_queue:
+        asyncio.create_task(_process_command_queue())
+
+
+async def _process_command_queue():
+    """Обработать следующую команду research/do из очереди."""
+    if not command_queue or claude_busy:
+        return
+    cmd_type, topic, original_message, from_plan = command_queue.pop(0)
+    # reply_fn через bot_ref — original_message мог устареть
+    if not bot_ref or not ADMIN_CHAT_ID:
+        return
+    reply_fn = lambda text, **kw: bot_ref.send_message(chat_id=ADMIN_CHAT_ID, text=text, **kw)
+    try:
+        await _safe_reply(reply_fn, f"Очередь: запускаю {cmd_type} «{topic[:60]}»...")
+    except Exception:
+        pass
+    if cmd_type == "research":
+        await _run_queued_research(reply_fn, topic, from_plan)
+    elif cmd_type == "do":
+        await _run_queued_do(reply_fn, topic, from_plan)
+
+
+async def _run_queued_research(reply_fn, topic: str, from_plan: bool):
+    """Research из очереди — упрощённая версия cmd_research без update/context."""
+    global claude_busy
+    if claude_busy:
+        return
+    claude_busy = True
+    realizaciya_dir = PROJECT_DIR / "realizaciya"
+    existing_files = {f.name for f in realizaciya_dir.glob("*.md")} if realizaciya_dir.exists() else set()
+    try:
+        short = topic[:80]
+        await _safe_reply(reply_fn, f"Исследование: {short}\n0:00")
+        _save_running_task("research", topic, from_plan)
+        prompt = build_research_prompt(topic)
+        loop = asyncio.get_event_loop()
+        success, output = await loop.run_in_executor(None, run_claude, prompt, RESEARCH_TIMEOUT)
+    finally:
+        _clear_running_task()
+        claude_busy = False
+        if ask_queue:
+            asyncio.create_task(_process_ask_queue())
+        _maybe_schedule_autopush()
+    if success:
+        if from_plan:
+            remove_from_plan(topic)
+        new_research = []
+        if realizaciya_dir.exists():
+            for f in realizaciya_dir.glob("*.md"):
+                if f.name not in existing_files and f.name != "index.md":
+                    title = f.name
+                    for line in f.read_text(encoding="utf-8").splitlines():
+                        if line.startswith("# "):
+                            title = line[2:].strip()
+                            break
+                    new_research.append({"path": f"realizaciya/{f.name}", "title": title})
+        if new_research:
+            titles = "\n".join(f"  {r['title']}" for r in new_research)
+            await _safe_reply(reply_fn, f"Исследование готово. Новое:\n{titles}")
+        else:
+            await _safe_reply(reply_fn, "Исследование готово (файлы обновлены).")
+        await _do_sync(reply_fn)
+        if new_research and bot_ref:
+            try:
+                await _send_research_to_group(bot_ref, new_research)
+            except Exception as e:
+                await _safe_reply(reply_fn, f"Ошибка отправки в группу: {e}")
+        await _offer_commit(reply_fn, f"research: {short}")
+    else:
+        summary = output[-500:] if output else "нет деталей"
+        await _safe_reply(reply_fn, f"Ошибка исследования.\n{summary}")
+
+
+async def _run_queued_do(reply_fn, topic: str, from_plan: bool):
+    """Do из очереди — упрощённая версия cmd_do без update/context."""
+    global claude_busy
+    if claude_busy:
+        return
+    claude_busy = True
+    try:
+        state = ""
+        state_path = PROJECT_DIR / "_sostoyaniye.md"
+        if state_path.exists():
+            state = state_path.read_text(encoding="utf-8")
+        prompt = (
+            f"## Контекст\n{state}\n\n"
+            f"## Задача\n{topic}\n\n"
+            "## Инструкции\n"
+            "Выполни задачу быстро. Результат — текст для Telegram.\n"
+            "НЕ создавай новые файлы в realizaciya/. НЕ трогай realizaciya/.\n"
+            "НЕ проводи полное исследование. НЕ делай web search (если не просят явно).\n"
+            "В _sostoyaniye.md: НЕ добавляй ссылки, телефоны, подробности. "
+            "Только короткие действия с тегом [do] или [research]. НЕ используй другие теги.\n"
+            "В КОНЦЕ выведи результат для Telegram (до 3500 символов, законченный текст).\n"
+            "Формат: HTML (parse_mode). <b>жирный</b>, НЕ **markdown**. Без --- разделителей.\n"
+            "Только полезный контент: текст письма, список вопросов, расчёт.\n"
+            "НЕ пиши какие файлы обновил, что сделал внутри — только результат для человека.\n"
+            "Действуй автономно."
+        )
+        loop = asyncio.get_event_loop()
+        success, output = await loop.run_in_executor(None, run_claude, prompt, DO_TIMEOUT)
+    finally:
+        claude_busy = False
+        if ask_queue:
+            asyncio.create_task(_process_ask_queue())
+        _maybe_schedule_autopush()
+    if success:
+        if from_plan:
+            remove_from_plan(topic)
+        await _offer_commit(reply_fn, f"do: {topic[:50]}")
+        summary = output.strip() if output else "(нет вывода)"
+        text = f"Готово.\n\n{summary}"
+        if len(text) > 3800:
+            text = text[:3800] + "\n...(обрезано)"
+        try:
+            await _safe_reply(reply_fn, text, parse_mode="HTML")
+        except Exception:
+            await _safe_reply(reply_fn, text)
+    else:
+        summary = output[-500:] if output else "нет деталей"
+        await _safe_reply(reply_fn, f"Ошибка.\n{summary}")
 
 
 async def _handle_ask(message, question: str):
@@ -1727,6 +1911,7 @@ async def _handle_ask(message, question: str):
         _maybe_schedule_autopush()
 
     if success:
+        await _offer_commit(message.reply_text, f"ask: {question[:50]}")
         answer = output.strip() if output else "(нет ответа)"
         if len(answer) > 3800:
             answer = answer[:3800] + "\n...(обрезано)"
@@ -1748,7 +1933,7 @@ async def _handle_ask(message, question: str):
 
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Текст от админа: алиасы команд, комментарий к вопросам, вопрос Claude, транскрипция."""
-    global claude_busy, pending_edit
+    global claude_busy, pending_edit, pending_command
     message = update.message
     if not message or not message.text:
         return
@@ -1757,6 +1942,10 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = message.text.strip()
     cmd = text.lower()
+
+    # Сохраняем и сбрасываем pending_command — он действует только на следующее сообщение
+    saved_pending_command = pending_command
+    pending_command = None
 
     # Текстовые алиасы (обратная совместимость)
     if cmd in ("push", "пуш"):
@@ -1773,7 +1962,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cmd_sync(update, context)
     if cmd in ("catchup", "подхвати"):
         return await cmd_catchup(update, context)
-    if cmd.startswith("исследуй") or cmd.startswith("research") or cmd.startswith("ресерч"):
+    if cmd.startswith("исследуй") or cmd.startswith("исследован") or cmd.startswith("research") or cmd.startswith("ресерч") or cmd.startswith("ресёрч"):
         parts = text.split(maxsplit=1)
         context.args = [parts[1].strip()] if len(parts) > 1 else []
         return await cmd_research(update, context)
@@ -1781,16 +1970,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = text.split(maxsplit=1)
         context.args = [parts[1].strip()] if len(parts) > 1 else []
         return await cmd_do(update, context)
-    if cmd in ("задачи ок", "tasks ok"):
-        pending = read_pending_tasks()
-        if not pending:
-            await message.reply_text("Нет задач на утверждение.")
-            return
-        add_tasks_to_sostoyaniye(pending)
-        PENDING_TASKS.unlink()
-        names = "\n".join(f"  {i+1}. {t.splitlines()[0]}" for i, t in enumerate(pending))
-        await message.reply_text(f"Добавлено в план ({len(pending)}):\n{names}")
-        return
+    # "задачи ок" / "tasks ok" — убрано: задачи управляются Claude напрямую
     # Явное добавление в буфер: "буфер <текст>"
     if cmd.startswith("буфер ") or cmd.startswith("buffer "):
         parts = text.split(maxsplit=1)
@@ -1807,11 +1987,28 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await cmd_buffer(update, context)
         return
 
-    # Комментарий по кнопке "Исправить" / "Доработать" / "Уточнить"
+    # Ответ на меню /research или /do (бот ждёт аргумент)
+    if saved_pending_command:
+        if cmd in ("ничего", "нет", "отмена", "не надо", "no"):
+            await message.reply_text("Ок.")
+            return
+        if saved_pending_command == "research":
+            context.args = [text]
+            return await cmd_research(update, context)
+        elif saved_pending_command == "do":
+            context.args = [text]
+            return await cmd_do(update, context)
+
+    # Комментарий по кнопке "Доработать" / "Уточнить"
     if pending_edit:
         # Таймаут: если "Уточнить" нажали давно (>10 мин) — сбросить, обработать как новый вопрос
         if pending_edit.get("type") == "ask" and time.time() - pending_edit.get("ts", 0) > 600:
             pending_edit = None
+        # Отмена: "ничего", "нет", "отмена", "ок", "ладно" → сбросить pending_edit
+        elif text.strip().lower() in ("ничего", "нет", "отмена", "ок", "ладно", "не надо", "всё", "все", "готово", "done", "no"):
+            pending_edit = None
+            await message.reply_text("Ок.")
+            return
         else:
             await _handle_edit_comment(message, text)
             return
@@ -2036,6 +2233,22 @@ async def post_init(app):
         print(f"  Bot API диагностика: ОШИБКА — {e}")
     # Дотранскрибировать голосовые из очереди (крэш во время транскрипции)
     await _catchup_pending_voices(app.bot)
+
+    # Recovery: прерванное исследование при рестарте
+    if RUNNING_TASK_FILE.exists():
+        try:
+            task_data = json.loads(RUNNING_TASK_FILE.read_text(encoding="utf-8"))
+            topic = task_data.get("topic", "?")
+            print(f"  [recovery] Прерванное исследование: {topic[:60]}")
+            if ADMIN_CHAT_ID:
+                await app.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=f"Исследование было прервано при рестарте:\n  {topic}\n\nЗапусти заново через /research",
+                )
+        except Exception as e:
+            print(f"  [recovery] Ошибка: {e}")
+        finally:
+            _clear_running_task()
 
     # Периодический catchup — подхватить пропущенное после сетевых сбоев
     CATCHUP_INTERVAL = 3600  # секунд (1 час)
