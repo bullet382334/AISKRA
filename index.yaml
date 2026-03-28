@@ -5,9 +5,44 @@
 каталог: katalog.yaml                # СУЩНОСТИ: люди, места, идеи, решения → быстрый поиск «что где»
 
 karta-idej:
-  digest: karta-idej/digest.md       # навигатор (лимит строк в CLAUDE.md)
+  digest: karta-idej/digest.md       # навигатор (≤25 строк)
+  digest-idei: karta-idej/digest-idei.md
+  digest-proekty: karta-idej/digest-proekty.md
+  digest-person: karta-idej/digest-person.md
   zhurnal: karta-idej/zhurnal.md     # хронологический лог
   idei: {}                           # карточки появятся после обработки
 
+kontekst:
+  profil-persona: kontekst/profil-persona.md
+  aktivy-i-resursy: kontekst/aktivy-i-resursy.md
+  uchastniki-i-roli: kontekst/uchastniki-i-roli.md
+  zanyatiya-persona: kontekst/zanyatiya-persona.md
+
+project:
+  readme: project/README.md          # файлы создаются по мере развития проекта
+
 realizaciya:                          # ЗАЩИЩЕНО — не менять без прямого запроса
   index: realizaciya/index.md
+
+intervyu:
+  bazovye-voprosy: intervyu/bazovye-voprosy.md
+  workflow: intervyu/workflow-adaptivnogo-intervyu.md
+  shablon-serii: intervyu/shablon-sleduyushchej-serii.md
+  otvety: {}                         # появятся после первых ответов
+  analiz: {}                         # появятся после анализа
+
+analitika:
+  checklist-gipotez: analitika/checklist-gipotez.md
+  kriterii-prioritizacii: analitika/kriterii-prioritizacii.md
+  ramka-proverki: analitika/ramka-proverki.md
+  shablon-vyvoda: analitika/shablon-vyvoda.md
+
+pravila:
+  principy-i-pravila: pravila/principy-i-pravila.md
+  protokol-raboty-s-ai: pravila/protokol-raboty-s-ai.md
+  workflow: pravila/workflow.md
+  zhiznennyj-cikl-idei: pravila/zhiznennyj-cikl-idei.md
+
+svodki: {}                            # появятся при создании сводок
+
+inbox: {}                             # неразобранные записи
