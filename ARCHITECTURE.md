@@ -195,10 +195,11 @@ Telegram-группа ──→ Бот ──→ Буфер ──→ Claude ─
 ### post_init (запуск бота)
 1. `telethon_client.start()` — подключение userbot
 2. `set_my_commands()` — регистрация меню команд
-3. Автообнаружение участников группы (`get_participants` → `GROUP_ALLOWED_IDS/USERNAMES`)
-4. `_catchup_pending_voices()` — дотранскрибировать голосовые из `pending_voices.json`
-5. `_catchup_group_history()` — подхватить пропущенные сообщения (голосовые + текст)
-6. `_periodic_catchup()` — фоновая задача каждые `CATCHUP_INTERVAL` = 3600 сек
+3. Автообнаружение участников группы (`get_participants` → `GROUP_ALLOWED_IDS/USERNAMES`, `_user_display_names` через Bot API)
+4. `BOT_USER_ID` = `bot_me.id` — для фильтрации своих сообщений в catchup
+5. `_catchup_pending_voices()` — дотранскрибировать голосовые из `pending_voices.json`
+6. `_catchup_group_history()` — подхватить пропущенные сообщения (голосовые + текст, с дедупликацией)
+7. `_periodic_catchup()` — фоновая задача каждые `CATCHUP_INTERVAL` = 3600 сек
 
 ### ensure_single_instance
 - `bot.pid` — если процесс жив, не запускать второй экземпляр; stale PID перезаписывается

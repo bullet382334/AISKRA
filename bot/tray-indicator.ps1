@@ -143,7 +143,7 @@ function Start-Bot {
         Start-Sleep -Seconds 3
         if ($proc.HasExited) {
             $logFile = Join-Path $BOT_DIR "_tray_crash.log"
-            "$(Get-Date) | PID=$($proc.Id) exit=$($proc.ExitCode) dir=$BOT_DIR" | Out-File $logFile -Append
+            "$(Get-Date) | PID=$($proc.Id) exit=$($proc.ExitCode) dir=$BOT_DIR" | Out-File $logFile -Append -Encoding UTF8
             [System.Windows.Forms.MessageBox]::Show(
                 "Bot crashed (exit $($proc.ExitCode)). Log: $logFile",
                 $BotName, 'OK', 'Error')

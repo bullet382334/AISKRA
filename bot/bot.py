@@ -3,17 +3,27 @@
 Накопитель: транскрибирует → копит в буфер → Claude только по команде /push.
 """
 
+import os
+import sys
+from pathlib import Path
+
+# Диагностика: логируем какой Python и sys.path ДО импортов
+_diag_file = Path(__file__).parent / "_tray_crash.log"
+try:
+    with open(_diag_file, "a", encoding="utf-8") as _f:
+        _f.write(f"\n--- startup PID={os.getpid()} exe={sys.executable} ---\n")
+        _f.write(f"sys.path[:5] = {sys.path[:5]}\n")
+except Exception:
+    pass
+
 import asyncio
 import json
-import os
 import re
 import shutil
 import signal
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import Update, Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,15 +39,6 @@ API_ID = int(os.environ["TELETHON_API_ID"])
 API_HASH = os.environ["TELETHON_API_HASH"]
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))
 GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
-
-# Имя бота из Telegram API (для логов и уведомлений)
-try:
-    import httpx as _httpx
-    _bot_me = _httpx.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=5).json()
-    BOT_NAME = _bot_me.get("result", {}).get("first_name", "Bot")
-    del _httpx, _bot_me
-except Exception:
-    BOT_NAME = "Bot"
 
 BUKVITSA_BOT = "BukvitsaAI_bot"
 PROJECT_DIR = Path(__file__).parent.parent
@@ -69,20 +70,36 @@ sync_proc: subprocess.Popen | None = None  # ссылка на процесс sy
 claude_busy = False
 ask_queue: list = []  # [(message, question), ...] — очередь вопросов пока Claude занят
 bot_ref: Bot | None = None
+BOT_USER_ID: int = 0  # заполняется в post_init — для фильтрации своих сообщений в catchup
 pending_edit: dict | None = None  # {"type": "tasks"} or {"type": "research", "slug": "..."} or {"type": "ask", ...}
 _last_ask: dict | None = None     # {"question": ..., "answer": ...} — контекст последнего ask для "Уточнить"
 _last_kb_msg = None               # Message — последнее сообщение с inline-кнопками (чтобы снять при новом)
+_user_display_names: dict[int, str] = {}  # user_id → каноническое имя (заполняется в post_init)
 
 
-def _display_name(user) -> str:
-    """Отображаемое имя: предпочитает известное имя из GROUP_ALLOWED_NAMES (first→last)."""
-    first = getattr(user, "first_name", "") or ""
-    last = getattr(user, "last_name", "") or ""
+def _resolve_name(first: str, last: str = "") -> str:
+    """Определить короткое имя из first_name/last_name полей Telegram."""
     if first in GROUP_ALLOWED_NAMES:
         return first
+    for name in GROUP_ALLOWED_NAMES:
+        if first.startswith(name):
+            return name
     if last in GROUP_ALLOWED_NAMES:
         return last
     return first or "?"
+
+
+def _display_name(user) -> str:
+    """Отображаемое имя: по ID (каноническое) → fallback по first/last name."""
+    uid = getattr(user, "id", None)
+    if uid and uid in _user_display_names:
+        return _user_display_names[uid]
+    first = getattr(user, "first_name", "") or ""
+    last = getattr(user, "last_name", "") or ""
+    resolved = _resolve_name(first, last)
+    if uid:
+        _user_display_names[uid] = resolved
+    return resolved
 
 
 def is_group_member(user) -> bool:
@@ -107,6 +124,8 @@ def is_group_member_telethon(sender) -> bool:
     if getattr(sender, "bot", False):
         return False
     sender_id = getattr(sender, "id", None)
+    if BOT_USER_ID and sender_id == BOT_USER_ID:
+        return False
     if GROUP_ALLOWED_IDS and sender_id in GROUP_ALLOWED_IDS:
         return True
     username = getattr(sender, "username", None) or ""
@@ -1343,7 +1362,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private and not is_group_member(message.from_user):
         return
     duration = getattr(media, "duration", None) or 0
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    msg_dt = message.date.astimezone() if message.date else datetime.now()
+    timestamp = msg_dt.strftime("%Y-%m-%d_%H-%M-%S")
 
     # Сохранить в очередь ДО транскрипции — если бот крашнется, подхватим при рестарте
     _save_pending_voice(media.file_id, sender, duration, timestamp)
@@ -1541,6 +1561,10 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sender = _display_name(message.from_user) if message.from_user else "?"
+    # Дедупликация: catchup мог уже добавить это сообщение через Telethon
+    if message.message_id in buffer_msg_ids():
+        print(f"  [группа-вход] ПРОПУСК: msg:{message.message_id} уже в буфере (catchup)")
+        return
     buffer_append(sender, "текст", text, message_id=message.message_id)
     count = buffer_count()
     preview = text[:100] + ("..." if len(text) > 100 else "")
@@ -1844,11 +1868,17 @@ async def _catchup_group_history(bot: Bot, force: bool = False):
             is_audio_doc = (msg.document and hasattr(msg.document, 'mime_type')
                            and msg.document.mime_type and msg.document.mime_type.startswith("audio/"))
             if msg.voice or msg.audio or msg.video_note or is_audio_doc:
-                pattern = f"{ts}_{sender_name}"
-                if any(pattern in s for s in existing_stems):
+                # Дедупликация по timestamp (без имени — оно может отличаться между Bot API и Telethon)
+                if any(s.startswith(ts) for s in existing_stems):
                     continue
                 media = msg.voice or msg.audio or msg.video_note or msg.document
                 duration = getattr(media, "duration", 0) or 0
+                # Telethon: duration хранится в DocumentAttributeAudio
+                if not duration:
+                    for attr in getattr(media, "attributes", []):
+                        duration = getattr(attr, "duration", 0) or 0
+                        if duration:
+                            break
                 print(f"  Catchup group: голосовое {sender_name} ({ts})")
                 # Скачать через Telethon, транскрибировать
                 audio_path = OUTPUT_DIR / f"_temp_{ts}.oga"
@@ -1890,7 +1920,7 @@ async def _catchup_group_history(bot: Bot, force: bool = False):
 
 
 async def post_init(app):
-    global bot_ref
+    global bot_ref, BOT_USER_ID
     await telethon_client.start()
     me = await telethon_client.get_me()
     print(f"  Userbot: {me.first_name} ({me.phone})")
@@ -1913,12 +1943,22 @@ async def post_init(app):
             # Автозаполнение usernames для фильтрации (без ботов)
             if p.username and not p.bot:
                 GROUP_ALLOWED_USERNAMES.add(p.username.lower())
-            if p.first_name and not p.bot:
-                GROUP_ALLOWED_NAMES.add(p.first_name)
+            # Каноническое имя: берём из Bot API (актуальнее Telethon-кеша)
+            if not p.bot:
+                try:
+                    member = await app.bot.get_chat_member(GROUP_CHAT_ID, p.id)
+                    _user_display_names[p.id] = _resolve_name(
+                        member.user.first_name or "", member.user.last_name or "")
+                except Exception:
+                    _user_display_names[p.id] = _resolve_name(
+                        p.first_name or "", getattr(p, "last_name", "") or "")
         GROUP_MEMBERS_FILE.write_text("\n".join(lines), encoding="utf-8")
         print(f"  Участники группы ({len(participants)}):")
         for line in lines:
             print(f"    {line}")
+        # Показать канонические имена
+        for uid, name in _user_display_names.items():
+            print(f"    → {uid} = {name}")
         if not GROUP_ALLOWED_IDS:
             # ID не заданы в .env — заполняем из участников (все участники группы = разрешены)
             for p in participants:
@@ -1930,6 +1970,7 @@ async def post_init(app):
     # Диагностика: проверить статус бота в группе через Bot API
     try:
         bot_me = await app.bot.get_me()
+        BOT_USER_ID = bot_me.id
         print(f"  Bot API: я = {bot_me.first_name} (id={bot_me.id})")
         chat = await app.bot.get_chat(GROUP_CHAT_ID)
         print(f"  Bot API: группа = {chat.title} (id={chat.id}, type={chat.type})")
@@ -2008,7 +2049,7 @@ def main():
 
     sys.stdout = sys.stderr = _Tee(original_out, log_file)
 
-    print(f"Бот {BOT_NAME} | PID {os.getpid()} | Админ {ADMIN_CHAT_ID} | Группа {GROUP_CHAT_ID}")
+    print(f"Бот | PID {os.getpid()} | Админ {ADMIN_CHAT_ID} | Группа {GROUP_CHAT_ID}")
 
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(connect_timeout=20.0, read_timeout=30.0)
@@ -2095,4 +2136,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        crash_file = Path(__file__).parent / "_tray_crash.log"
+        with open(crash_file, "a", encoding="utf-8") as f:
+            f.write(f"\n--- {datetime.now()} PID={os.getpid()} ---\n")
+            traceback.print_exc(file=f)
+        sys.exit(1)
