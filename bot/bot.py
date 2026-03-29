@@ -71,6 +71,8 @@ sync_lock = asyncio.Lock()
 sync_proc: subprocess.Popen | None = None  # ссылка на процесс sync для возможности остановки
 claude_busy = False
 _autopush_scheduled = False  # защита от повторных авто-push
+_catchup_running = False  # защита: не пушить пока catchup добавляет сообщения
+_processed_msg_ids: set[int] = set()  # msg:ID обработанных сообщений (переживает buffer_clear)
 _push_start_count = 0  # сколько было в буфере при старте push (для корректного отображения)
 ask_queue: list = []  # [(message, question), ...] — очередь вопросов пока Claude занят
 command_queue: list = []  # [("research", topic, reply_fn, from_plan), ...] — очередь research/do
@@ -186,7 +188,7 @@ def buffer_append(sender: str, duration_str: str, text: str, message_id: int = 0
 def _maybe_schedule_autopush():
     """Проверяет порог буфера и планирует авто-push если нужно."""
     global _autopush_scheduled
-    if _autopush_scheduled or claude_busy:
+    if _autopush_scheduled or claude_busy or _catchup_running:
         return
     count = buffer_count()
     if count >= AUTOPUSH_THRESHOLD:
@@ -242,6 +244,9 @@ def buffer_clear(original_raw: str = ""):
     """Архивирует обработанную часть буфера. Новые записи, пришедшие во время /push, сохраняются."""
     if not BUFFER_FILE.exists():
         return
+    # Запомнить msg:ID обработанных сообщений — для dedup после clear
+    cleared_content = original_raw or BUFFER_FILE.read_text(encoding="utf-8")
+    _processed_msg_ids.update(int(m) for m in re.findall(r"msg:(\d+)", cleared_content))
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     archive = BUFFER_FILE.with_name(f"buffer_{ts}.md")
     if original_raw:
@@ -325,7 +330,7 @@ async def transcribe_via_bukvitsa(audio_path: str) -> str:
                             extracted = msg.text.split(marker, 1)[1]
                             if "Создано в Буквица" in extracted:
                                 extracted = extracted.split("Создано в Буквица")[0]
-                            text = extracted.strip()
+                            text = extracted.strip().rstrip("[").strip()
                             if text:
                                 await asyncio.sleep(15)
                                 msgs2 = await telethon_client.get_messages(
@@ -466,7 +471,7 @@ def build_push_prompt(buffer_content: str) -> str:
         "1. ДОБАВЬ новые из транскрипций (свежие сверху, формат: '- [do] ...' или '- [research] ...')\n"
         "2. УДАЛИ выполненные [do] (транскрипция содержит ответ/результат)\n"
         "3. УДАЛИ устаревшие [do] (контекст изменился)\n"
-        "ВАЖНО: [research] задачи НИКОГДА не удаляй — они закрываются ТОЛЬКО ботом после выполнения.\n"
+        "[research] задачи: УДАЛИ если в realizaciya/index.md уже есть готовое исследование по этой теме. Иначе — оставь.\n"
         "4. НЕ дублируй — пересмотри каждый пункт\n"
         "5. Формат строки: КОРОТКО, БЕЗ ссылок на файлы, БЕЗ URL, БЕЗ → realizaciya/...\n"
         "[do] = действие человека. [research] = исследование AI.\n"
@@ -498,7 +503,7 @@ def build_research_prompt(task: str) -> str:
         "ОБЯЗАТЕЛЬНО используй web search для актуальных данных.\n"
         "Следуй skill workflow-realizaciya (шаблон файла, структура).\n"
         "Обнови realizaciya/index.md, index.yaml, katalog.yaml и _sostoyaniye.md.\n"
-        "В _sostoyaniye.md: [research] задачи НЕ трогай (бот удалит сам после завершения). "
+        "В _sostoyaniye.md: текущую [research] задачу УДАЛИ (бот тоже удалит, но на всякий случай). "
         "УДАЛИ [do] которые исследование сделало неактуальными. "
         "Новые задачи — с тегом: '- [do] ...' или '- [research] ...'. Свежие сверху.\n"
         "Создай bot/msg-{slug}.txt по skill format-research-tg (slug = имя файла без .md).\n"
@@ -522,14 +527,14 @@ def parse_plan() -> dict:
 
 
 def remove_from_plan(task_text: str):
-    """Удаляет выполненную задачу из _sostoyaniye.md."""
+    """Удаляет выполненную задачу из _sostoyaniye.md (case-insensitive)."""
     path = PROJECT_DIR / "_sostoyaniye.md"
     if not path.exists():
         return
     content = path.read_text(encoding="utf-8")
     lines = content.splitlines()
-    needle = task_text[:40]
-    new_lines = [l for l in lines if needle not in l]
+    needle = task_text[:40].lower()
+    new_lines = [l for l in lines if needle not in l.lower()]
     if len(new_lines) < len(lines):
         path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
@@ -1229,8 +1234,7 @@ async def cmd_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _maybe_schedule_autopush()
 
     if success:
-        if from_plan:
-            remove_from_plan(topic)
+        remove_from_plan(topic)
         short_topic = topic[:50]
         await _offer_commit(message.reply_text, f"do: {short_topic}")
         # Показать результат Claude
@@ -1362,8 +1366,7 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(_process_ask_queue())
         _maybe_schedule_autopush()
     if success:
-        if from_plan:
-            remove_from_plan(topic)
+        remove_from_plan(topic)
         # Показать только НОВЫЕ файлы (не все грязные)
         new_research = []
         if realizaciya_dir.exists():
@@ -1442,6 +1445,14 @@ async def _process_voice(bot: Bot, file_id: str, sender: str, duration: int, ts:
     """Единая обработка голосового: скачать → Буквица → md → буфер → уведомление."""
     dur_min, dur_sec = duration // 60, duration % 60
     dur_str = f"{dur_min}:{dur_sec:02d}"
+
+    # Дедупликация: если транскрипция уже есть — пропустить
+    md_dedup = OUTPUT_DIR / f"{ts}_{sender}.md"
+    if md_dedup.exists():
+        _remove_pending_voice(file_id)
+        print(f"  [voice-dedup] {md_dedup.name} уже есть, пропускаю")
+        return
+
     audio_path = OUTPUT_DIR / f"_temp_{ts}.oga"
 
     # Скачать если ещё нет
@@ -1465,6 +1476,13 @@ async def _process_voice(bot: Bot, file_id: str, sender: str, duration: int, ts:
 
     md_name = f"{ts}_{sender}.md"
     md_path = OUTPUT_DIR / md_name
+    # Повторная проверка ПОСЛЕ транскрипции: пока ждали bukvitsa_lock,
+    # другой обработчик (catchup/PTB) мог уже создать этот файл
+    if md_path.exists():
+        audio_path.unlink(missing_ok=True)
+        _remove_pending_voice(file_id)
+        print(f"  [voice-dedup] {md_name} создан пока ждали транскрипцию")
+        return
     md_path.write_text(
         f"---\nдата: {ts[:10]} {ts[11:13]}:{ts[14:16]}\n"
         f"от: {sender}\nдлительность: {dur_min} мин {dur_sec} сек\nразобрано: нет\n---\n\n{text}\n",
@@ -1676,8 +1694,8 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sender = _display_name(message.from_user) if message.from_user else "?"
     # Дедупликация: catchup мог уже добавить это сообщение через Telethon
-    if message.message_id in buffer_msg_ids():
-        print(f"  [группа-вход] ПРОПУСК: msg:{message.message_id} уже в буфере (catchup)")
+    if message.message_id in buffer_msg_ids() or message.message_id in _processed_msg_ids:
+        print(f"  [группа-вход] ПРОПУСК: msg:{message.message_id} уже в буфере/обработано (catchup)")
         return
     buffer_append(sender, "текст", text, message_id=message.message_id)
     cnt = buffer_count_display()
@@ -1783,8 +1801,7 @@ async def _run_queued_research(reply_fn, topic: str, from_plan: bool):
             asyncio.create_task(_process_ask_queue())
         _maybe_schedule_autopush()
     if success:
-        if from_plan:
-            remove_from_plan(topic)
+        remove_from_plan(topic)
         new_research = []
         if realizaciya_dir.exists():
             for f in realizaciya_dir.glob("*.md"):
@@ -1846,8 +1863,7 @@ async def _run_queued_do(reply_fn, topic: str, from_plan: bool):
             asyncio.create_task(_process_ask_queue())
         _maybe_schedule_autopush()
     if success:
-        if from_plan:
-            remove_from_plan(topic)
+        remove_from_plan(topic)
         await _offer_commit(reply_fn, f"do: {topic[:50]}")
         summary = output.strip() if output else "(нет вывода)"
         text = f"Готово.\n\n{summary}"
@@ -2042,6 +2058,8 @@ BOT_COMMANDS = [
 
 async def _catchup_pending_voices(bot: Bot):
     """При старте: дотранскрибировать голосовые из pending_voices.json (крэш до завершения)."""
+    global _catchup_running
+    _catchup_running = True  # guard от auto-push на всё время startup-catchup
     if not PENDING_VOICES.exists():
         print("  Catchup pending: очередь пуста")
     else:
@@ -2051,9 +2069,12 @@ async def _catchup_pending_voices(bot: Bot):
             pending = []
         if pending:
             print(f"  Catchup pending: {len(pending)} голосовых в очереди")
-            for v in pending:
+        for v in pending:
+            try:
                 print(f"  Catchup: {v['sender']} ({v['ts']}), транскрибирую...")
                 await _process_voice(bot, v["file_id"], v["sender"], v["duration"], v["ts"], tag="[подхвачено]")
+            except Exception as e:
+                print(f"  Catchup pending: ошибка {v.get('ts','?')}: {e}")
 
     # Проверить пропущенные голосовые в группе через Telethon
     await _catchup_group_history(bot)
@@ -2062,6 +2083,8 @@ async def _catchup_pending_voices(bot: Bot):
 async def _catchup_group_history(bot: Bot, force: bool = False):
     """Проверить последние сообщения в группе, подхватить пропущенные голосовые и текст.
     force=True — игнорировать фильтр по времени (подхватить всё из последних 50 сообщений)."""
+    global _catchup_running
+    _catchup_running = True
     try:
         existing_stems = {f.stem for f in OUTPUT_DIR.glob("*.md")}
 
@@ -2168,6 +2191,9 @@ async def _catchup_group_history(bot: Bot, force: bool = False):
                 )
     except Exception as e:
         print(f"  Catchup group ошибка: {e}")
+    finally:
+        _catchup_running = False
+        _maybe_schedule_autopush()  # теперь проверить — может пора пушить
 
 
 async def post_init(app):
