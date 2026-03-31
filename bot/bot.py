@@ -1401,8 +1401,6 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if heartbeat_task:
             heartbeat_task.cancel()
         claude_busy = False
-        if ask_queue:
-            asyncio.create_task(_process_ask_queue())
         _maybe_schedule_autopush()
     if success:
         remove_from_plan(topic)
@@ -1443,6 +1441,13 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         summary = output[-500:] if output else "нет деталей"
         await message.reply_text(f"Ошибка исследования.\n{summary}")
+
+    # Запустить следующую задачу из очереди (после sync и отправки)
+    if not claude_busy:
+        if ask_queue:
+            asyncio.create_task(_process_ask_queue())
+        elif command_queue:
+            asyncio.create_task(_process_command_queue())
 
 
 # --- Telegram: обработчики ---
@@ -1840,8 +1845,6 @@ async def _run_queued_research(reply_fn, topic: str, from_plan: bool):
     finally:
         _clear_running_task()
         claude_busy = False
-        if ask_queue:
-            asyncio.create_task(_process_ask_queue())
         _maybe_schedule_autopush()
     if success:
         remove_from_plan(topic)
@@ -1870,6 +1873,13 @@ async def _run_queued_research(reply_fn, topic: str, from_plan: bool):
     else:
         summary = output[-500:] if output else "нет деталей"
         await _safe_reply(reply_fn, f"Ошибка исследования.\n{summary}")
+
+    # Запустить следующую задачу из очереди (после sync и отправки)
+    if not claude_busy:
+        if ask_queue:
+            asyncio.create_task(_process_ask_queue())
+        elif command_queue:
+            asyncio.create_task(_process_command_queue())
 
 
 async def _run_queued_do(reply_fn, topic: str, from_plan: bool):
