@@ -1835,15 +1835,41 @@ async def _run_queued_research(reply_fn, topic: str, from_plan: bool):
     claude_busy = True
     realizaciya_dir = PROJECT_DIR / "realizaciya"
     existing_files = {f.name for f in realizaciya_dir.glob("*.md")} if realizaciya_dir.exists() else set()
+    heartbeat_task = None
     try:
         short = topic[:80]
-        await _safe_reply(reply_fn, f"Исследование: {short}\n0:00")
+        try:
+            status_msg = await _safe_reply(reply_fn, f"Исследование: {short}\n0:00")
+        except Exception:
+            status_msg = None
+
+        async def _heartbeat():
+            start = asyncio.get_event_loop().time()
+            while True:
+                await asyncio.sleep(30)
+                elapsed = int(asyncio.get_event_loop().time() - start)
+                mins, secs = elapsed // 60, elapsed % 60
+                new_files = []
+                if realizaciya_dir.exists():
+                    for f in realizaciya_dir.glob("*.md"):
+                        if f.name not in existing_files and f.name != "index.md":
+                            new_files.append(f.name)
+                files_info = f" | +{len(new_files)} файлов" if new_files else ""
+                try:
+                    await status_msg.edit_text(f"Исследование: {short}\n{mins}:{secs:02d}{files_info}")
+                except Exception:
+                    pass
+
+        if status_msg:
+            heartbeat_task = asyncio.create_task(_heartbeat())
         _save_running_task("research", topic, from_plan)
         prompt = build_research_prompt(topic)
         loop = asyncio.get_event_loop()
         success, output = await loop.run_in_executor(None, run_claude, prompt, RESEARCH_TIMEOUT)
     finally:
         _clear_running_task()
+        if heartbeat_task:
+            heartbeat_task.cancel()
         claude_busy = False
         _maybe_schedule_autopush()
     if success:
