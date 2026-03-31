@@ -76,6 +76,7 @@ _processed_msg_ids: set[int] = set()  # msg:ID обработанных сооб
 _push_start_count = 0  # сколько было в буфере при старте push (для корректного отображения)
 ask_queue: list = []  # [(message, question), ...] — очередь вопросов пока Claude занят
 command_queue: list = []  # [("research", topic, reply_fn, from_plan), ...] — очередь research/do
+COMMAND_QUEUE_FILE = Path(__file__).parent / "command_queue.json"
 bot_ref: Bot | None = None
 BOT_USER_ID: int = 0  # заполняется в post_init — для фильтрации своих сообщений в catchup
 pending_edit: dict | None = None  # {"type": "research", "slug": "..."} or {"type": "ask", ...}
@@ -83,6 +84,32 @@ pending_command: str | None = None  # "research" или "do" — бот ждёт
 _last_ask: dict | None = None     # {"question": ..., "answer": ...} — контекст последнего ask для "Уточнить"
 _last_kb_msg = None               # Message — последнее сообщение с inline-кнопками (чтобы снять при новом)
 _user_display_names: dict[int, str] = {}  # user_id → каноническое имя (заполняется в post_init)
+
+
+def _save_command_queue():
+    """Сохранить command_queue на диск (без reply_fn — она пересоздаётся при загрузке)."""
+    data = []
+    for item in command_queue:
+        cmd_type, topic, _msg, from_plan = item
+        data.append({"type": cmd_type, "topic": topic, "from_plan": from_plan})
+    if data:
+        COMMAND_QUEUE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    elif COMMAND_QUEUE_FILE.exists():
+        COMMAND_QUEUE_FILE.unlink()
+
+
+def _load_command_queue():
+    """Загрузить command_queue с диска при старте бота."""
+    if not COMMAND_QUEUE_FILE.exists():
+        return
+    try:
+        data = json.loads(COMMAND_QUEUE_FILE.read_text(encoding="utf-8"))
+        for item in data:
+            command_queue.append((item["type"], item["topic"], None, item["from_plan"]))
+        if data:
+            print(f"  Восстановлена очередь: {len(data)} задач", flush=True)
+    except Exception as e:
+        print(f"  [!] Ошибка загрузки очереди: {e}", flush=True)
 
 
 def _resolve_name(first: str, last: str = "") -> str:
@@ -500,7 +527,17 @@ def build_research_prompt(task: str) -> str:
         "## Инструкции\n"
         "Проведи исследование СТРОГО по задаче выше. НЕ подменяй тему, не расширяй scope.\n"
         "Создавай НОВЫЙ файл в realizaciya/ — не обновляй существующие файлы других исследований.\n"
-        "ОБЯЗАТЕЛЬНО используй web search для актуальных данных.\n"
+        "\n"
+        "## Качество исследования — КРИТИЧНО\n"
+        "ОБЯЗАТЕЛЬНО используй web search для актуальных данных 2025–2026 года.\n"
+        "НЕ используй данные старше 2024 года как основные — только как историю.\n"
+        "Каждая цифра, ставка, цена — должна иметь источник и год.\n"
+        "Пиши КОНКРЕТНО: не «цена может варьироваться», а конкретную цифру с источником.\n"
+        "Давай КОНКРЕТНЫЕ имена площадок, сервисов, компаний с датами и ссылками.\n"
+        "Структура файла: # Заголовок, > Статус: готово, ## Главное (3-5 ключевых выводов), затем детали.\n"
+        "Секция «## Главное» — ОБЯЗАТЕЛЬНА.\n"
+        "НЕ включай в файл персональные данные: телефоны, адреса, паспортные данные, номера счетов.\n"
+        "\n"
         "Следуй skill workflow-realizaciya (шаблон файла, структура).\n"
         "Обнови realizaciya/index.md, index.yaml, katalog.yaml и _sostoyaniye.md.\n"
         "В _sostoyaniye.md: текущую [research] задачу УДАЛИ (бот тоже удалит, но на всякий случай). "
@@ -1191,6 +1228,7 @@ async def cmd_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from_plan = True
     if claude_busy:
         command_queue.append(("do", topic, message, from_plan))
+        _save_command_queue()
         await message.reply_text(f"Claude занят. Задача «{topic[:60]}» в очереди, запустится автоматически.")
         return
     claude_busy = True
@@ -1316,6 +1354,7 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from_plan = True
     if claude_busy:
         command_queue.append(("research", topic, message, from_plan))
+        _save_command_queue()
         await message.reply_text(f"Claude занят. Исследование «{topic[:60]}» в очереди, запустится автоматически.")
         return
     claude_busy = True
@@ -1765,8 +1804,12 @@ async def _process_command_queue():
     if not command_queue or claude_busy:
         return
     cmd_type, topic, original_message, from_plan = command_queue.pop(0)
+    _save_command_queue()
     # reply_fn через bot_ref — original_message мог устареть
     if not bot_ref or not ADMIN_CHAT_ID:
+        # Вернуть задачу в очередь — бот ещё не готов
+        command_queue.insert(0, (cmd_type, topic, original_message, from_plan))
+        _save_command_queue()
         return
     reply_fn = lambda text, **kw: bot_ref.send_message(chat_id=ADMIN_CHAT_ID, text=text, **kw)
     try:
@@ -2129,7 +2172,7 @@ async def _catchup_group_history(bot: Bot, force: bool = False):
             "\n".join(debug_lines), encoding="utf-8",
         )
 
-        catchup_known_ids = buffer_msg_ids()
+        catchup_known_ids = buffer_msg_ids() | _processed_msg_ids
         for msg in reversed(messages):  # от старых к новым
             if not is_group_member_telethon(msg.sender):
                 continue
@@ -2290,6 +2333,11 @@ async def post_init(app):
 
     asyncio.create_task(_periodic_catchup())
     print(f"  Catchup-таймер: каждые {CATCHUP_INTERVAL // 60} мин")
+
+    # Восстановить очередь команд (research/do) после рестарта
+    _load_command_queue()
+    if command_queue:
+        asyncio.create_task(_process_command_queue())
 
     # Проверить буфер при старте — мог накопиться до перезапуска
     _maybe_schedule_autopush()
