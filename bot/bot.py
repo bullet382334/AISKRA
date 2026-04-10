@@ -61,6 +61,7 @@ GROUP_ALLOWED_USERNAMES: set[str] = set()  # заполняется автома
 GROUP_ALLOWED_NAMES: set[str] = set()  # fallback — заполняется из участников группы
 GROUP_MEMBERS_FILE = Path(__file__).parent / "group_members.txt"
 PENDING_VOICES = Path(__file__).parent / "pending_voices.json"
+PROCESSED_VOICE_IDS_FILE = Path(__file__).parent / "processed_voice_ids.json"
 RUNNING_TASK_FILE = Path(__file__).parent / "_running_task.json"
 
 telethon_client = TelegramClient(
@@ -1484,6 +1485,23 @@ def _remove_pending_voice(file_id: str):
         pass
 
 
+def _load_processed_voice_ids() -> set[int]:
+    """Загрузить msg.id уже транскрибированных голосовых из catchup."""
+    if not PROCESSED_VOICE_IDS_FILE.exists():
+        return set()
+    try:
+        return set(json.loads(PROCESSED_VOICE_IDS_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _add_processed_voice_id(msg_id: int):
+    """Сохранить msg.id транскрибированного голосового (персистентно)."""
+    ids = _load_processed_voice_ids()
+    ids.add(msg_id)
+    PROCESSED_VOICE_IDS_FILE.write_text(json.dumps(sorted(ids)), encoding="utf-8")
+
+
 async def _process_voice(bot: Bot, file_id: str, sender: str, duration: int, ts: str,
                          reply_fn=None, tag: str = ""):
     """Единая обработка голосового: скачать → Буквица → md → буфер → уведомление."""
@@ -1572,6 +1590,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply_fn = message.reply_text if is_private else None
     await _process_voice(context.bot, media.file_id, sender, duration, timestamp, reply_fn)
+    if (OUTPUT_DIR / f"{timestamp}_{sender}.md").exists():
+        _add_processed_voice_id(message.message_id)
 
 
 async def _handle_edit_comment(message, comment: str):
@@ -2209,20 +2229,29 @@ async def _catchup_group_history(bot: Bot, force: bool = False):
         )
 
         catchup_known_ids = buffer_msg_ids() | _processed_msg_ids
+        processed_voice_ids = _load_processed_voice_ids()
         for msg in reversed(messages):  # от старых к новым
             if not is_group_member_telethon(msg.sender):
                 continue
             sender_name = _display_name(msg.sender) if msg.sender else "?"
 
             local_dt = msg.date.astimezone()
-            ts = local_dt.strftime("%Y-%m-%d_%H-%M-%S")
+            ts_local = local_dt.strftime("%Y-%m-%d_%H-%M-%S")
+            ts_utc = msg.date.strftime("%Y-%m-%d_%H-%M-%S")
+            ts = ts_local  # используем local для создания файлов (обратная совместимость)
 
             # Голосовое (включая пересланные аудио-документы)
             is_audio_doc = (msg.document and hasattr(msg.document, 'mime_type')
                            and msg.document.mime_type and msg.document.mime_type.startswith("audio/"))
             if msg.voice or msg.audio or msg.video_note or is_audio_doc:
-                # Дедупликация по timestamp (без имени — оно может отличаться между Bot API и Telethon)
-                if any(s.startswith(ts) for s in existing_stems):
+                # Дедупликация 1: по Telegram msg.id (надёжно, не зависит от timezone)
+                if msg.id in processed_voice_ids:
+                    continue
+                # Дедупликация 2: по timestamp файла — проверяем local И utc вариант
+                # (для обратной совместимости при смене timezone/летнего времени)
+                if any(s.startswith(ts_local) or s.startswith(ts_utc) for s in existing_stems):
+                    _add_processed_voice_id(msg.id)  # запомнить, чтобы следующий catchup не пересматривал
+                    processed_voice_ids.add(msg.id)
                     continue
                 media = msg.voice or msg.audio or msg.video_note or msg.document
                 duration = getattr(media, "duration", 0) or 0
@@ -2239,6 +2268,9 @@ async def _catchup_group_history(bot: Bot, force: bool = False):
                 catchup_id = f"catchup_{ts}"
                 _save_pending_voice(catchup_id, sender_name, duration, ts)
                 await _process_voice(bot, catchup_id, sender_name, duration, ts, tag="[подхвачено]")
+                if (OUTPUT_DIR / f"{ts}_{sender_name}.md").exists():
+                    _add_processed_voice_id(msg.id)
+                    processed_voice_ids.add(msg.id)
                 continue
 
             # Текст
